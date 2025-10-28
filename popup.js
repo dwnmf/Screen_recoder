@@ -101,24 +101,25 @@ async function startRecording() {
       }
     }
 
+    // Determine a targetTabId to anchor desktop picker in MV3
+    let targetTabId = null;
+    try {
+      const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      targetTabId = active?.id ?? null;
+    } catch (_) {}
+
     let response;
     if (captureMode === 'browser') {
-      // Ask background/offscreen to handle picker and recording
+      // Ask background to run the desktop picker (service worker) with a target tab
       response = await chrome.runtime.sendMessage({
         action: 'startCapture',
         captureMode: captureMode,
         tabId: null,
+        targetTabId: targetTabId,
         fps: fps,
         includeAudio: includeAudio
       });
     } else {
-      // Determine a targetTabId to anchor desktop picker in MV3 (in case background falls back)
-      let targetTabId = null;
-      try {
-        const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-        targetTabId = active?.id ?? null;
-      } catch (_) {}
-
       response = await chrome.runtime.sendMessage({
         action: 'startCapture',
         captureMode: captureMode,

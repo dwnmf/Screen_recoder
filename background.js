@@ -95,9 +95,50 @@ async function handleStartCapture(options, sender) {
     let allowAudio = !!options.includeAudio;
     
     if (captureMode === 'browser') {
-      // Defer the desktop picker to the offscreen document so that
-      // the streamId is consumed in the same document.
-      streamId = null;
+      // Run the desktop picker from the service worker with a target tab.
+      // This avoids MV3 errors that require a target tab when not called
+      // from a visible tab context.
+      const sources = allowAudio ? ['window', 'screen', 'audio'] : ['window', 'screen'];
+
+      // Resolve target tab: prefer explicit targetTabId, fallback to sender tab, then active tab
+      let targetTab = null;
+      try {
+        const targetTabId = options.targetTabId || sender?.tab?.id;
+        if (targetTabId) {
+          targetTab = await chrome.tabs.get(targetTabId);
+        } else {
+          const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+          targetTab = active || null;
+        }
+      } catch (e) {
+        // ignore, we'll pass null and let API error if required
+      }
+
+      streamId = await new Promise((resolve, reject) => {
+        try {
+          chrome.desktopCapture.chooseDesktopMedia(
+            sources,
+            targetTab || undefined,
+            (chosenStreamId, pickerOptions) => {
+              const lastErr = chrome.runtime.lastError?.message || '';
+              if (!chosenStreamId) {
+                if (lastErr) console.warn('chooseDesktopMedia error:', lastErr);
+                reject(new Error('User cancelled desktop capture'));
+                return;
+              }
+              // If audio requested but picker/OS cannot provide it, disable audio and warn UI
+              const canRequestAudio = !!(pickerOptions && pickerOptions.canRequestAudioTrack);
+              if (allowAudio && !canRequestAudio) {
+                allowAudio = false;
+                chrome.runtime.sendMessage({ action: 'recordingWarning', message: 'Recording without audio' }).catch(() => {});
+              }
+              resolve(chosenStreamId);
+            }
+          );
+        } catch (e) {
+          reject(e);
+        }
+      });
     } else {
       console.log('Requesting tab capture for tabId:', options.tabId);
       streamId = await new Promise((resolve, reject) => {

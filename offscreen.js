@@ -191,6 +191,10 @@ async function startRecording(streamId, captureMode, options) {
 
       const result = await new Promise((resolve, reject) => {
         try {
+          if (!chrome.desktopCapture || typeof chrome.desktopCapture.chooseDesktopMedia !== 'function') {
+            reject(new Error('Desktop capture API unavailable in offscreen context'));
+            return;
+          }
           chrome.desktopCapture.chooseDesktopMedia(sources, (chosenStreamId, pickerOptions) => {
             const lastErr = chrome.runtime.lastError?.message || '';
             if (!chosenStreamId) {
