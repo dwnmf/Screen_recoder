@@ -92,17 +92,35 @@ async function handleStartCapture(options) {
       const sources = ['window', 'screen'];
       if (wantAudio) sources.push('audio');
 
+      // In MV3 service worker, a target tab is required for chooseDesktopMedia
+      const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!activeTab) {
+        throw new Error('No active tab found to anchor screen picker. Focus a tab and try again.');
+      }
+
       const result = await new Promise((resolve, reject) => {
-        console.log('Requesting desktop capture with sources:', sources);
-        chrome.desktopCapture.chooseDesktopMedia(sources, (chosenStreamId, pickerOptions) => {
-          if (!chosenStreamId) {
-            console.error('User cancelled desktop capture or no streamId returned');
-            reject(new Error('User cancelled desktop capture'));
-            return;
-          }
-          const canRequestAudio = !!(pickerOptions && pickerOptions.canRequestAudioTrack);
-          resolve({ chosenStreamId, canRequestAudio });
-        });
+        console.log('Requesting desktop capture with sources:', sources, 'targetTab:', activeTab.id);
+        try {
+          chrome.desktopCapture.chooseDesktopMedia(
+            sources,
+            activeTab,
+            (chosenStreamId, pickerOptions) => {
+              const lastErr = chrome.runtime.lastError?.message || '';
+              if (!chosenStreamId) {
+                if (lastErr) {
+                  console.warn('chooseDesktopMedia error:', lastErr);
+                }
+                // Treat no streamId as user cancel for UX clarity
+                reject(new Error('User cancelled desktop capture'));
+                return;
+              }
+              const canRequestAudio = !!(pickerOptions && pickerOptions.canRequestAudioTrack);
+              resolve({ chosenStreamId, canRequestAudio });
+            }
+          );
+        } catch (e) {
+          reject(e);
+        }
       });
 
       streamId = result.chosenStreamId;
