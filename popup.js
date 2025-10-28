@@ -100,14 +100,62 @@ async function startRecording() {
         tabId = parsed;
       }
     }
-    
-    const response = await chrome.runtime.sendMessage({
-      action: 'startCapture',
-      captureMode: captureMode,
-      tabId: tabId,
-      fps: fps,
-      includeAudio: includeAudio
-    });
+
+    // For browser mode, request desktop picker directly from the popup to avoid
+    // MV3 service worker targetTab requirements and preserve user gesture.
+    let response;
+    if (captureMode === 'browser') {
+      const sources = ['window', 'screen'];
+      if (includeAudio) sources.push('audio');
+
+      const { streamId, canRequestAudio } = await new Promise((resolve, reject) => {
+        try {
+          chrome.desktopCapture.chooseDesktopMedia(sources, (chosenStreamId, pickerOptions) => {
+            const lastErr = chrome.runtime.lastError?.message || '';
+            if (!chosenStreamId) {
+              if (lastErr) console.warn('chooseDesktopMedia (popup) error:', lastErr);
+              reject(new Error('User cancelled desktop capture'));
+              return;
+            }
+            resolve({
+              streamId: chosenStreamId,
+              canRequestAudio: !!(pickerOptions && pickerOptions.canRequestAudioTrack)
+            });
+          });
+        } catch (e) {
+          reject(e);
+        }
+      });
+
+      const allowAudio = includeAudio && canRequestAudio;
+      if (includeAudio && !allowAudio) {
+        audioNoteDiv.textContent = 'Recording without audio';
+      }
+
+      response = await chrome.runtime.sendMessage({
+        action: 'startCaptureWithStreamId',
+        captureMode: 'browser',
+        streamId: streamId,
+        fps: fps,
+        includeAudio: allowAudio
+      });
+    } else {
+      // Determine a targetTabId to anchor desktop picker in MV3 (in case background falls back)
+      let targetTabId = null;
+      try {
+        const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        targetTabId = active?.id ?? null;
+      } catch (_) {}
+
+      response = await chrome.runtime.sendMessage({
+        action: 'startCapture',
+        captureMode: captureMode,
+        tabId: tabId,
+        targetTabId: targetTabId,
+        fps: fps,
+        includeAudio: includeAudio
+      });
+    }
     
     if (!response.success) {
       throw new Error(response.error || 'Failed to start recording');

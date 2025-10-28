@@ -33,7 +33,7 @@ async function setupOffscreenDocument() {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === 'startCapture') {
-    handleStartCapture(message)
+    handleStartCapture(message, sender)
       .then(response => sendResponse(response))
       .catch(error => sendResponse({ success: false, error: error.message }));
     return true;
@@ -42,6 +42,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === 'stopCapture') {
     chrome.runtime.sendMessage({ action: 'stopRecording' })
       .then(() => sendResponse({ success: true }))
+      .catch(error => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+  
+  if (message.action === 'startCaptureWithStreamId') {
+    handleStartWithProvidedStreamId(message)
+      .then(response => sendResponse(response))
       .catch(error => sendResponse({ success: false, error: error.message }));
     return true;
   }
@@ -78,7 +85,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
-async function handleStartCapture(options) {
+async function handleStartCapture(options, sender) {
   try {
     console.log('handleStartCapture called with options:', options);
     await setupOffscreenDocument();
@@ -93,17 +100,28 @@ async function handleStartCapture(options) {
       if (wantAudio) sources.push('audio');
 
       // In MV3 service worker, a target tab is required for chooseDesktopMedia
-      const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (!activeTab) {
+      // Prefer the tab provided by popup, then sender.tab, then last focused active tab.
+      let targetTab = null;
+      if (options.targetTabId) {
+        try { targetTab = await chrome.tabs.get(options.targetTabId); } catch (_) {}
+      }
+      if (!targetTab && sender && sender.tab) {
+        targetTab = sender.tab;
+      }
+      if (!targetTab) {
+        const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        targetTab = tabs && tabs[0];
+      }
+      if (!targetTab) {
         throw new Error('No active tab found to anchor screen picker. Focus a tab and try again.');
       }
 
       const result = await new Promise((resolve, reject) => {
-        console.log('Requesting desktop capture with sources:', sources, 'targetTab:', activeTab.id);
+        console.log('Requesting desktop capture with sources:', sources, 'targetTab:', targetTab.id);
         try {
           chrome.desktopCapture.chooseDesktopMedia(
             sources,
-            activeTab,
+            targetTab,
             (chosenStreamId, pickerOptions) => {
               const lastErr = chrome.runtime.lastError?.message || '';
               if (!chosenStreamId) {
@@ -172,5 +190,28 @@ async function handleStartCapture(options) {
   } catch (error) {
     console.error('Failed to start capture:', error);
     throw error;
+  }
+}
+
+async function handleStartWithProvidedStreamId(payload) {
+  try {
+    await setupOffscreenDocument();
+    if (!payload.streamId) {
+      throw new Error('Missing streamId');
+    }
+    const captureMode = payload.captureMode || 'browser';
+    const response = await chrome.runtime.sendMessage({
+      action: 'startRecording',
+      streamId: payload.streamId,
+      captureMode: captureMode,
+      options: {
+        fps: payload.fps,
+        includeAudio: !!payload.includeAudio
+      }
+    });
+    return response;
+  } catch (e) {
+    console.error('Failed to start with provided streamId:', e);
+    throw e;
   }
 }
