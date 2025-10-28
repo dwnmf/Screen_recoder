@@ -133,11 +133,6 @@ async function startRecording(streamId, captureMode, options) {
         };
       } else {
         constraints.audio = {
-          // Use modern constraint syntax to prevent browser audio muting
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-          suppressLocalAudioPlayback: false,
           mandatory: {
             chromeMediaSource: mediaSource,
             chromeMediaSourceId: streamId
@@ -181,6 +176,18 @@ async function startRecording(streamId, captureMode, options) {
         });
 
         startLocalAudioPlayback(stream);
+
+        if (captureMode !== 'browser') {
+          try {
+            await Promise.all(audioTracks.map(track => track.applyConstraints({
+              echoCancellation: false,
+              noiseSuppression: false,
+              autoGainControl: false
+            })));
+          } catch (error) {
+            console.warn('Failed to adjust audio track constraints:', error);
+          }
+        }
       }
     }
     
