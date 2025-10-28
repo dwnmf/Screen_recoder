@@ -101,43 +101,15 @@ async function startRecording() {
       }
     }
 
-    // For browser mode, request desktop picker directly from the popup to avoid
-    // MV3 service worker targetTab requirements and preserve user gesture.
     let response;
     if (captureMode === 'browser') {
-      const sources = ['window', 'screen'];
-      if (includeAudio) sources.push('audio');
-
-      const { streamId, canRequestAudio } = await new Promise((resolve, reject) => {
-        try {
-          chrome.desktopCapture.chooseDesktopMedia(sources, (chosenStreamId, pickerOptions) => {
-            const lastErr = chrome.runtime.lastError?.message || '';
-            if (!chosenStreamId) {
-              if (lastErr) console.warn('chooseDesktopMedia (popup) error:', lastErr);
-              reject(new Error('User cancelled desktop capture'));
-              return;
-            }
-            resolve({
-              streamId: chosenStreamId,
-              canRequestAudio: !!(pickerOptions && pickerOptions.canRequestAudioTrack)
-            });
-          });
-        } catch (e) {
-          reject(e);
-        }
-      });
-
-      const allowAudio = includeAudio && canRequestAudio;
-      if (includeAudio && !allowAudio) {
-        audioNoteDiv.textContent = 'Recording without audio';
-      }
-
+      // Ask background/offscreen to handle picker and recording
       response = await chrome.runtime.sendMessage({
-        action: 'startCaptureWithStreamId',
-        captureMode: 'browser',
-        streamId: streamId,
+        action: 'startCapture',
+        captureMode: captureMode,
+        tabId: null,
         fps: fps,
-        includeAudio: allowAudio
+        includeAudio: includeAudio
       });
     } else {
       // Determine a targetTabId to anchor desktop picker in MV3 (in case background falls back)

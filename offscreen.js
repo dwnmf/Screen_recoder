@@ -174,12 +174,44 @@ async function startRecording(streamId, captureMode, options) {
       throw new Error('Recording already in progress');
     }
 
-    // Validate streamId
-    if (!streamId) {
+    // Validate streamId: required for tab capture; for desktop capture the
+    // offscreen document may request it via chooseDesktopMedia below.
+    if (!streamId && captureMode !== 'browser') {
       throw new Error('Invalid stream ID: stream ID is required');
     }
 
     console.log('Starting recording with:', { streamId, captureMode, options });
+
+    // For desktop capture, allow the offscreen document to invoke the picker
+    // so that the resulting streamId is consumed in the same document.
+    if (captureMode === 'browser' && !streamId) {
+      const wantAudio = !!options.includeAudio;
+      const sources = ['window', 'screen'];
+      if (wantAudio) sources.push('audio');
+
+      const result = await new Promise((resolve, reject) => {
+        try {
+          chrome.desktopCapture.chooseDesktopMedia(sources, (chosenStreamId, pickerOptions) => {
+            const lastErr = chrome.runtime.lastError?.message || '';
+            if (!chosenStreamId) {
+              if (lastErr) console.warn('chooseDesktopMedia (offscreen) error:', lastErr);
+              reject(new Error('User cancelled desktop capture'));
+              return;
+            }
+            resolve({
+              chosenStreamId,
+              canRequestAudio: !!(pickerOptions && pickerOptions.canRequestAudioTrack)
+            });
+          });
+        } catch (e) { reject(e); }
+      });
+
+      streamId = result.chosenStreamId;
+      if (wantAudio && !result.canRequestAudio) {
+        options.includeAudio = false;
+        chrome.runtime.sendMessage({ action: 'recordingWarning', message: 'Recording without audio' }).catch(() => {});
+      }
+    }
 
     const mediaSource = captureMode === 'browser' ? 'desktop' : 'tab';
 

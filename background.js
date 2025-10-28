@@ -95,63 +95,9 @@ async function handleStartCapture(options, sender) {
     let allowAudio = !!options.includeAudio;
     
     if (captureMode === 'browser') {
-      const wantAudio = !!options.includeAudio;
-      const sources = ['window', 'screen'];
-      if (wantAudio) sources.push('audio');
-
-      // In MV3 service worker, a target tab is required for chooseDesktopMedia
-      // Prefer the tab provided by popup, then sender.tab, then last focused active tab.
-      let targetTab = null;
-      if (options.targetTabId) {
-        try { targetTab = await chrome.tabs.get(options.targetTabId); } catch (_) {}
-      }
-      if (!targetTab && sender && sender.tab) {
-        targetTab = sender.tab;
-      }
-      if (!targetTab) {
-        const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-        targetTab = tabs && tabs[0];
-      }
-      if (!targetTab) {
-        throw new Error('No active tab found to anchor screen picker. Focus a tab and try again.');
-      }
-
-      const result = await new Promise((resolve, reject) => {
-        console.log('Requesting desktop capture with sources:', sources, 'targetTab:', targetTab.id);
-        try {
-          chrome.desktopCapture.chooseDesktopMedia(
-            sources,
-            targetTab,
-            (chosenStreamId, pickerOptions) => {
-              const lastErr = chrome.runtime.lastError?.message || '';
-              if (!chosenStreamId) {
-                if (lastErr) {
-                  console.warn('chooseDesktopMedia error:', lastErr);
-                }
-                // Treat no streamId as user cancel for UX clarity
-                reject(new Error('User cancelled desktop capture'));
-                return;
-              }
-              const canRequestAudio = !!(pickerOptions && pickerOptions.canRequestAudioTrack);
-              resolve({ chosenStreamId, canRequestAudio });
-            }
-          );
-        } catch (e) {
-          reject(e);
-        }
-      });
-
-      streamId = result.chosenStreamId;
-      // Разрешаем аудио только если пользователь отметил «Share system audio»
-      allowAudio = wantAudio && result.canRequestAudio;
-      if (wantAudio && !allowAudio) {
-        console.warn('System audio was not granted in the picker; continuing without audio.');
-        // Notify UI that we will record without audio
-        chrome.runtime.sendMessage({
-          action: 'recordingWarning',
-          message: 'Recording without audio'
-        }).catch(() => {});
-      }
+      // Defer the desktop picker to the offscreen document so that
+      // the streamId is consumed in the same document.
+      streamId = null;
     } else {
       console.log('Requesting tab capture for tabId:', options.tabId);
       streamId = await new Promise((resolve, reject) => {
