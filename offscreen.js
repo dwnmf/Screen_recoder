@@ -112,6 +112,13 @@ async function startRecording(streamId, captureMode, options) {
       throw new Error('Recording already in progress');
     }
 
+    // Validate streamId
+    if (!streamId) {
+      throw new Error('Invalid stream ID: stream ID is required');
+    }
+
+    console.log('Starting recording with:', { streamId, captureMode, options });
+
     const mediaSource = captureMode === 'browser' ? 'desktop' : 'tab';
     
     const constraintsModern = {
@@ -144,33 +151,58 @@ async function startRecording(streamId, captureMode, options) {
     };
 
     let lastError = null;
+    let tryWithoutAudio = false;
+    
     for (const constraints of [constraintsModern, constraintsLegacy]) {
       try {
+        console.log('Trying getUserMedia with constraints:', constraints);
         stream = await navigator.mediaDevices.getUserMedia(constraints);
+        console.log('Successfully got media stream');
         lastError = null;
         break;
       } catch (err) {
+        console.error('getUserMedia failed:', err);
         lastError = err;
+        
         const malformed = /Malformed constraint/i.test(err.message || '');
         const mixed = /optional|mandatory.*specific|advanced/i.test(err.message || '');
         const isNotFound = err.name === 'NotFoundError' || /Requested device not found/i.test(err.message || '');
-        if (options.includeAudio && isNotFound) {
-          console.warn('Audio device for capture not found; retrying without audio');
-          const retryConstraints = { ...constraints, audio: false };
-          stream = await navigator.mediaDevices.getUserMedia(retryConstraints);
-          // Reflect that audio is disabled going forward
-          options.includeAudio = false;
-          lastError = null;
-          break;
+        const isPermissionDenied = err.name === 'NotAllowedError' || /permission/i.test(err.message || '');
+        
+        if (isPermissionDenied) {
+          throw new Error('Permission denied. Please allow screen capture access.');
         }
+        
+        // If audio device not found, try without audio
+        if (options.includeAudio && isNotFound && !tryWithoutAudio) {
+          console.warn('Audio device not found, retrying without audio');
+          tryWithoutAudio = true;
+          try {
+            const retryConstraints = JSON.parse(JSON.stringify(constraints));
+            retryConstraints.audio = false;
+            console.log('Retry constraints without audio:', retryConstraints);
+            stream = await navigator.mediaDevices.getUserMedia(retryConstraints);
+            console.log('Successfully got media stream without audio');
+            options.includeAudio = false;
+            lastError = null;
+            break;
+          } catch (retryErr) {
+            console.error('Retry without audio also failed:', retryErr);
+            lastError = retryErr;
+          }
+        }
+        
+        // Only try the next constraint variant if the error suggests constraint format issues
         if (!(malformed || mixed)) {
-          // Only try the next variant if the error suggests constraint shape issues
           break;
         }
       }
     }
+    
     if (!stream) {
-      throw lastError || new Error('Failed to acquire capture stream');
+      const errorMsg = lastError ? `${lastError.name}: ${lastError.message}` : 'Failed to acquire capture stream';
+      console.error('All getUserMedia attempts failed:', errorMsg);
+      throw new Error(errorMsg);
     }
 
     const videoTrack = stream.getVideoTracks()[0];
@@ -184,7 +216,7 @@ async function startRecording(streamId, captureMode, options) {
     // Validate and monitor audio tracks if audio is enabled
     if (options.includeAudio) {
       if (audioTracks.length === 0) {
-        console.warn('No audio tracks found, recording will be video-only');
+        console.warn('No audio tracks found on the captured source (system audio likely not granted by picker/OS). Recording will be video-only.');
       } else {
         console.log(`Audio capture enabled: ${audioTracks.length} audio track(s) found`);
         

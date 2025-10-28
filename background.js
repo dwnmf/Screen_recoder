@@ -19,8 +19,8 @@ async function setupOffscreenDocument() {
 
     await chrome.offscreen.createDocument({
       url: 'offscreen.html',
-      reasons: ['USER_MEDIA'],
-      justification: 'Recording tab screen with MediaRecorder API'
+      reasons: ['DISPLAY_MEDIA'],
+      justification: 'Screen/tab recording with MediaRecorder API from an offscreen document'
     });
     
     offscreenDocumentCreated = true;
@@ -78,45 +78,60 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 async function handleStartCapture(options) {
   try {
+    console.log('handleStartCapture called with options:', options);
     await setupOffscreenDocument();
     
     let streamId;
     let captureMode = options.captureMode || 'tab';
+    let allowAudio = !!options.includeAudio;
     
     if (captureMode === 'browser') {
-      streamId = await new Promise((resolve, reject) => {
-        const sources = ['window', 'screen'];
-        // Request system audio if user opted in
-        if (options.includeAudio) sources.push('audio');
+      const wantAudio = !!options.includeAudio;
+      const sources = ['window', 'screen'];
+      if (wantAudio) sources.push('audio');
 
-        chrome.desktopCapture.chooseDesktopMedia(
-          sources,
-          (chosenStreamId) => {
-            if (!chosenStreamId) {
-              reject(new Error('User cancelled desktop capture'));
-              return;
-            }
-            resolve(chosenStreamId);
+      const result = await new Promise((resolve, reject) => {
+        console.log('Requesting desktop capture with sources:', sources);
+        chrome.desktopCapture.chooseDesktopMedia(sources, (chosenStreamId, pickerOptions) => {
+          if (!chosenStreamId) {
+            console.error('User cancelled desktop capture or no streamId returned');
+            reject(new Error('User cancelled desktop capture'));
+            return;
           }
-        );
+          const canRequestAudio = !!(pickerOptions && pickerOptions.canRequestAudioTrack);
+          resolve({ chosenStreamId, canRequestAudio });
+        });
       });
+
+      streamId = result.chosenStreamId;
+      // Разрешаем аудио только если пользователь отметил «Share system audio»
+      allowAudio = wantAudio && result.canRequestAudio;
+      if (wantAudio && !allowAudio) {
+        console.warn('System audio was not granted in the picker; continuing without audio.');
+      }
     } else {
+      console.log('Requesting tab capture for tabId:', options.tabId);
       streamId = await new Promise((resolve, reject) => {
         chrome.tabCapture.getMediaStreamId({
           targetTabId: options.tabId
         }, (streamId) => {
           if (chrome.runtime.lastError) {
+            console.error('Tab capture error:', chrome.runtime.lastError.message);
             reject(new Error(chrome.runtime.lastError.message));
             return;
           }
           if (!streamId) {
-            reject(new Error('Failed to get stream ID'));
+            console.error('Tab capture returned empty streamId');
+            reject(new Error('Failed to get stream ID from tab capture'));
             return;
           }
+          console.log('Tab capture streamId obtained:', streamId);
           resolve(streamId);
         });
       });
     }
+    
+    console.log('Sending startRecording message to offscreen with streamId:', streamId);
 
     const response = await chrome.runtime.sendMessage({
       action: 'startRecording',
@@ -124,7 +139,7 @@ async function handleStartCapture(options) {
       captureMode: captureMode,
       options: {
         fps: options.fps,
-        includeAudio: options.includeAudio
+        includeAudio: allowAudio
       }
     });
 
