@@ -116,32 +116,16 @@ async function startRecording(streamId, captureMode, options) {
     
     const constraints = {
       video: {
-        mandatory: {
-          chromeMediaSource: mediaSource,
-          chromeMediaSourceId: streamId
-        }
-      }
+        chromeMediaSource: mediaSource,
+        chromeMediaSourceId: streamId
+      },
+      audio: options.includeAudio
+        ? {
+            chromeMediaSource: mediaSource,
+            chromeMediaSourceId: streamId
+          }
+        : false
     };
-    
-    if (options.includeAudio) {
-      if (captureMode === 'browser') {
-        constraints.audio = {
-          mandatory: {
-            chromeMediaSource: mediaSource,
-            chromeMediaSourceId: streamId
-          }
-        };
-      } else {
-        constraints.audio = {
-          mandatory: {
-            chromeMediaSource: mediaSource,
-            chromeMediaSourceId: streamId
-          }
-        };
-      }
-    } else {
-      constraints.audio = false;
-    }
 
     stream = await navigator.mediaDevices.getUserMedia(constraints);
 
