@@ -191,11 +191,8 @@ async function startRecording(streamId, captureMode, options) {
             lastError = retryErr;
           }
         }
-        
-        // Only try the next constraint variant if the error suggests constraint format issues
-        if (!(malformed || mixed)) {
-          break;
-        }
+        // Continue to next constraint variant (legacy/modern) before giving up
+        // unless we hit a permission error handled above.
       }
     }
     

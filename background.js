@@ -19,8 +19,8 @@ async function setupOffscreenDocument() {
 
     await chrome.offscreen.createDocument({
       url: 'offscreen.html',
-      reasons: ['DISPLAY_MEDIA'],
-      justification: 'Screen/tab recording with MediaRecorder API from an offscreen document'
+      reasons: ['DISPLAY_MEDIA', 'AUDIO_PLAYBACK'],
+      justification: 'Screen/tab recording with MediaRecorder API from an offscreen document and local audio playback preview'
     });
     
     offscreenDocumentCreated = true;
