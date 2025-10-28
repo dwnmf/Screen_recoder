@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tab Screen Recorder</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <h1>Screen Recorder</h1>
+    
+    <div class="settings">
+      <div class="setting-group">
+        <label>Capture Mode:</label>
+        <div class="radio-group">
+          <label class="radio-label">
+            <input type="radio" name="captureMode" value="tab" checked>
+            <span>Tab</span>
+          </label>
+          <label class="radio-label">
+            <input type="radio" name="captureMode" value="browser">
+            <span>Browser Window</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="setting-group" id="tabSelectGroup">
+        <label for="tabSelect">Tab to Record:</label>
+        <select id="tabSelect">
+          <option value="current">Current Tab</option>
+        </select>
+      </div>
+
+      <div class="setting-group">
+        <label for="fps">Frame Rate:</label>
+        <select id="fps">
+          <option value="15">15 FPS</option>
+          <option value="24">24 FPS</option>
+          <option value="30" selected>30 FPS</option>
+          <option value="60">60 FPS</option>
+        </select>
+      </div>
+
+      <div class="setting-group">
+        <label class="checkbox-label">
+          <input type="checkbox" id="audio">
+          <span>Record audio</span>
+        </label>
+      </div>
+    </div>
+
+    <div class="controls">
+      <button id="startBtn" class="btn btn-start">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"></circle>
+          <circle cx="12" cy="12" r="3" fill="currentColor"></circle>
+        </svg>
+        Start Recording
+      </button>
+      <button id="stopBtn" class="btn btn-stop" disabled>
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="6" y="6" width="12" height="12" fill="currentColor"></rect>
+        </svg>
+        Stop Recording
+      </button>
+    </div>
+
+    <div id="status" class="status"></div>
+    <div id="timer" class="timer">00:00</div>
+    <div id="bufferSize" class="buffer-size"></div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
