@@ -114,7 +114,7 @@ async function startRecording(streamId, captureMode, options) {
 
     const mediaSource = captureMode === 'browser' ? 'desktop' : 'tab';
     
-    const constraints = {
+    const constraintsModern = {
       video: {
         chromeMediaSource: mediaSource,
         chromeMediaSourceId: streamId
@@ -126,8 +126,52 @@ async function startRecording(streamId, captureMode, options) {
           }
         : false
     };
+    const constraintsLegacy = {
+      video: {
+        mandatory: {
+          chromeMediaSource: mediaSource,
+          chromeMediaSourceId: streamId
+        }
+      },
+      audio: options.includeAudio
+        ? {
+            mandatory: {
+              chromeMediaSource: mediaSource,
+              chromeMediaSourceId: streamId
+            }
+          }
+        : false
+    };
 
-    stream = await navigator.mediaDevices.getUserMedia(constraints);
+    let lastError = null;
+    for (const constraints of [constraintsModern, constraintsLegacy]) {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+        lastError = null;
+        break;
+      } catch (err) {
+        lastError = err;
+        const malformed = /Malformed constraint/i.test(err.message || '');
+        const mixed = /optional|mandatory.*specific|advanced/i.test(err.message || '');
+        const isNotFound = err.name === 'NotFoundError' || /Requested device not found/i.test(err.message || '');
+        if (options.includeAudio && isNotFound) {
+          console.warn('Audio device for capture not found; retrying without audio');
+          const retryConstraints = { ...constraints, audio: false };
+          stream = await navigator.mediaDevices.getUserMedia(retryConstraints);
+          // Reflect that audio is disabled going forward
+          options.includeAudio = false;
+          lastError = null;
+          break;
+        }
+        if (!(malformed || mixed)) {
+          // Only try the next variant if the error suggests constraint shape issues
+          break;
+        }
+      }
+    }
+    if (!stream) {
+      throw lastError || new Error('Failed to acquire capture stream');
+    }
 
     const videoTrack = stream.getVideoTracks()[0];
     const audioTracks = stream.getAudioTracks();

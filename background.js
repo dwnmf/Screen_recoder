@@ -85,8 +85,12 @@ async function handleStartCapture(options) {
     
     if (captureMode === 'browser') {
       streamId = await new Promise((resolve, reject) => {
+        const sources = ['window', 'screen'];
+        // Request system audio if user opted in
+        if (options.includeAudio) sources.push('audio');
+
         chrome.desktopCapture.chooseDesktopMedia(
-          ['window', 'screen'],
+          sources,
           (chosenStreamId) => {
             if (!chosenStreamId) {
               reject(new Error('User cancelled desktop capture'));
