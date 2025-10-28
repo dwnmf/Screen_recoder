@@ -101,10 +101,14 @@ async function startRecording(streamId, captureMode, options) {
         };
       } else {
         constraints.audio = {
+          // Use modern constraint syntax to prevent browser audio muting
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          suppressLocalAudioPlayback: false,
           mandatory: {
             chromeMediaSource: mediaSource,
-            chromeMediaSourceId: streamId,
-            suppressLocalAudioPlayback: false
+            chromeMediaSourceId: streamId
           }
         };
       }
@@ -115,6 +119,38 @@ async function startRecording(streamId, captureMode, options) {
     stream = await navigator.mediaDevices.getUserMedia(constraints);
 
     const videoTrack = stream.getVideoTracks()[0];
+    const audioTracks = stream.getAudioTracks();
+    
+    // Validate video track
+    if (!videoTrack) {
+      throw new Error('No video track available');
+    }
+    
+    // Validate and monitor audio tracks if audio is enabled
+    if (options.includeAudio) {
+      if (audioTracks.length === 0) {
+        console.warn('No audio tracks found, recording will be video-only');
+      } else {
+        console.log(`Audio capture enabled: ${audioTracks.length} audio track(s) found`);
+        
+        // Monitor audio track state
+        audioTracks.forEach((track, index) => {
+          track.addEventListener('ended', () => {
+            console.warn(`Audio track ${index} ended unexpectedly`);
+          });
+          
+          track.addEventListener('mute', () => {
+            console.warn(`Audio track ${index} was muted`);
+          });
+          
+          track.addEventListener('unmute', () => {
+            console.log(`Audio track ${index} was unmuted`);
+          });
+        });
+      }
+    }
+    
+    // Apply video constraints
     if (videoTrack && options.fps) {
       try {
         await videoTrack.applyConstraints({
@@ -184,9 +220,22 @@ async function startRecording(streamId, captureMode, options) {
     
     mediaRecorder.onerror = (error) => {
       console.error('MediaRecorder error:', error);
+      
+      // Enhanced error handling for audio-specific issues
+      let errorMessage = 'Recording error';
+      if (error.message) {
+        if (error.message.includes('audio') || error.message.includes('Audio')) {
+          errorMessage = 'Audio capture error: ' + error.message;
+        } else if (error.message.includes('permission') || error.message.includes('Permission')) {
+          errorMessage = 'Permission denied: ' + error.message;
+        } else {
+          errorMessage = error.message;
+        }
+      }
+      
       chrome.runtime.sendMessage({
         action: 'recordingError',
-        error: error.message || 'Recording error'
+        error: errorMessage
       });
     };
     
