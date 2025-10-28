@@ -4,6 +4,7 @@ let stream = null;
 let startTime = 0;
 let bufferSizeInterval = null;
 let currentBufferSize = 0;
+let audioPlaybackElement = null;
 const MAX_BUFFER_SIZE = 500 * 1024 * 1024;
 const WARNING_BUFFER_SIZE = 400 * 1024 * 1024;
 
@@ -47,6 +48,37 @@ function stopBufferMonitoring() {
     bufferSizeInterval = null;
   }
   currentBufferSize = 0;
+}
+
+function startLocalAudioPlayback(sourceStream) {
+  stopLocalAudioPlayback();
+
+  audioPlaybackElement = document.createElement('audio');
+  audioPlaybackElement.style.display = 'none';
+  audioPlaybackElement.srcObject = sourceStream;
+  audioPlaybackElement.autoplay = true;
+  audioPlaybackElement.muted = false;
+  audioPlaybackElement.playsInline = true;
+
+  document.body.appendChild(audioPlaybackElement);
+
+  const playPromise = audioPlaybackElement.play();
+  if (playPromise && typeof playPromise.catch === 'function') {
+    playPromise.catch(error => {
+      console.warn('Failed to start local audio playback preview:', error);
+    });
+  }
+}
+
+function stopLocalAudioPlayback() {
+  if (!audioPlaybackElement) {
+    return;
+  }
+
+  audioPlaybackElement.pause();
+  audioPlaybackElement.srcObject = null;
+  audioPlaybackElement.remove();
+  audioPlaybackElement = null;
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -147,6 +179,8 @@ async function startRecording(streamId, captureMode, options) {
             console.log(`Audio track ${index} was unmuted`);
           });
         });
+
+        startLocalAudioPlayback(stream);
       }
     }
     
@@ -216,6 +250,8 @@ async function startRecording(streamId, captureMode, options) {
         stream.getTracks().forEach(track => track.stop());
         stream = null;
       }
+
+      stopLocalAudioPlayback();
     };
     
     mediaRecorder.onerror = (error) => {
@@ -252,6 +288,7 @@ async function startRecording(streamId, captureMode, options) {
   } catch (error) {
     console.error('Failed to start recording:', error);
     stopBufferMonitoring();
+    stopLocalAudioPlayback();
     if (stream) {
       stream.getTracks().forEach(track => track.stop());
       stream = null;
@@ -264,6 +301,7 @@ async function stopRecording() {
   return new Promise((resolve, reject) => {
     if (!mediaRecorder || mediaRecorder.state === 'inactive') {
       stopBufferMonitoring();
+      stopLocalAudioPlayback();
       resolve();
       return;
     }
@@ -304,6 +342,8 @@ async function stopRecording() {
         stream.getTracks().forEach(track => track.stop());
         stream = null;
       }
+
+      stopLocalAudioPlayback();
     };
     
     mediaRecorder.stop();
