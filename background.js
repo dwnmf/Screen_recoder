@@ -71,7 +71,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === 'bufferSizeUpdate' || 
       message.action === 'recordingComplete' || 
       message.action === 'recordingError' ||
-      message.action === 'recordingStarted') {
+      message.action === 'recordingStarted' ||
+      message.action === 'recordingWarning' ||
+      message.action === 'audioData') {
     chrome.runtime.sendMessage(message).catch(() => {});
   }
 });
@@ -108,6 +110,11 @@ async function handleStartCapture(options) {
       allowAudio = wantAudio && result.canRequestAudio;
       if (wantAudio && !allowAudio) {
         console.warn('System audio was not granted in the picker; continuing without audio.');
+        // Notify UI that we will record without audio
+        chrome.runtime.sendMessage({
+          action: 'recordingWarning',
+          message: 'Recording without audio'
+        }).catch(() => {});
       }
     } else {
       console.log('Requesting tab capture for tabId:', options.tabId);

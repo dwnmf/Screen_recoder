@@ -5,6 +5,9 @@ let startTime = 0;
 let bufferSizeInterval = null;
 let currentBufferSize = 0;
 let audioPlaybackElement = null;
+let audioContext = null;
+let analyserNode = null;
+let visualizerInterval = null;
 const MAX_BUFFER_SIZE = 500 * 1024 * 1024;
 const WARNING_BUFFER_SIZE = 400 * 1024 * 1024;
 
@@ -79,6 +82,65 @@ function stopLocalAudioPlayback() {
   audioPlaybackElement.srcObject = null;
   audioPlaybackElement.remove();
   audioPlaybackElement = null;
+}
+
+function startAudioVisualizer(sourceStream) {
+  stopAudioVisualizer();
+  try {
+    const hasAudio = sourceStream && sourceStream.getAudioTracks && sourceStream.getAudioTracks().length > 0;
+    if (!hasAudio) return;
+
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    const source = audioContext.createMediaStreamSource(sourceStream);
+    analyserNode = audioContext.createAnalyser();
+    analyserNode.fftSize = 1024; // frequencyBinCount = 512
+    analyserNode.smoothingTimeConstant = 0.85;
+    source.connect(analyserNode);
+
+    const rawBins = new Uint8Array(analyserNode.frequencyBinCount);
+    const targetBars = 32;
+
+    visualizerInterval = setInterval(() => {
+      if (!analyserNode) return;
+      analyserNode.getByteFrequencyData(rawBins);
+
+      // Downsample to fixed number of bars
+      const bucketSize = Math.floor(rawBins.length / targetBars) || 1;
+      const bars = new Array(targetBars).fill(0);
+      for (let i = 0; i < targetBars; i++) {
+        let sum = 0;
+        let count = 0;
+        const start = i * bucketSize;
+        const end = Math.min(rawBins.length, start + bucketSize);
+        for (let j = start; j < end; j++) { sum += rawBins[j]; count++; }
+        bars[i] = count ? Math.round(sum / count) : 0;
+      }
+
+      chrome.runtime.sendMessage({ action: 'audioData', bars }).catch(() => {});
+    }, 100);
+
+    // Attempt to resume context in case it's suspended
+    if (audioContext.state === 'suspended') {
+      audioContext.resume().catch(() => {});
+    }
+  } catch (e) {
+    console.warn('Audio visualizer setup failed:', e);
+  }
+}
+
+function stopAudioVisualizer() {
+  if (visualizerInterval) {
+    clearInterval(visualizerInterval);
+    visualizerInterval = null;
+  }
+  if (analyserNode) {
+    try { analyserNode.disconnect(); } catch (_) {}
+    analyserNode = null;
+  }
+  if (audioContext) {
+    try { audioContext.close(); } catch (_) {}
+    audioContext = null;
+  }
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -184,6 +246,11 @@ async function startRecording(streamId, captureMode, options) {
             stream = await navigator.mediaDevices.getUserMedia(retryConstraints);
             console.log('Successfully got media stream without audio');
             options.includeAudio = false;
+            // Inform UI that we are recording without audio after fallback
+            chrome.runtime.sendMessage({
+              action: 'recordingWarning',
+              message: 'Recording without audio'
+            }).catch(() => {});
             lastError = null;
             break;
           } catch (retryErr) {
@@ -210,42 +277,54 @@ async function startRecording(streamId, captureMode, options) {
       throw new Error('No video track available');
     }
     
-    // Validate and monitor audio tracks if audio is enabled
-    if (options.includeAudio) {
-      if (audioTracks.length === 0) {
-        console.warn('No audio tracks found on the captured source (system audio likely not granted by picker/OS). Recording will be video-only.');
-      } else {
-        console.log(`Audio capture enabled: ${audioTracks.length} audio track(s) found`);
-        
-        // Monitor audio track state
-        audioTracks.forEach((track, index) => {
-          track.addEventListener('ended', () => {
-            console.warn(`Audio track ${index} ended unexpectedly`);
-          });
-          
-          track.addEventListener('mute', () => {
-            console.warn(`Audio track ${index} was muted`);
-          });
-          
-          track.addEventListener('unmute', () => {
-            console.log(`Audio track ${index} was unmuted`);
-          });
+    // Validate and monitor audio tracks
+    const audioEnabled = options.includeAudio && audioTracks.length > 0;
+    if (!audioEnabled && options.includeAudio) {
+      console.warn('No audio tracks found on the captured source (system audio likely not granted by picker/OS). Recording will be video-only.');
+      chrome.runtime.sendMessage({
+        action: 'recordingWarning',
+        message: 'Recording without audio'
+      }).catch(() => {});
+    }
+
+    if (audioEnabled) {
+      console.log(`Audio capture enabled: ${audioTracks.length} audio track(s) found`);
+
+      // Monitor audio track state
+      audioTracks.forEach((track, index) => {
+        track.addEventListener('ended', () => {
+          console.warn(`Audio track ${index} ended unexpectedly`);
         });
+        track.addEventListener('mute', () => {
+          console.warn(`Audio track ${index} was muted`);
+        });
+        track.addEventListener('unmute', () => {
+          console.log(`Audio track ${index} was unmuted`);
+        });
+      });
 
+      // Only preview local audio for tab mode to avoid feedback loops with system audio
+      if (captureMode === 'tab') {
         startLocalAudioPlayback(stream);
+      }
 
-        if (captureMode !== 'browser') {
-          try {
-            await Promise.all(audioTracks.map(track => track.applyConstraints({
-              echoCancellation: false,
-              noiseSuppression: false,
-              autoGainControl: false
-            })));
-          } catch (error) {
-            console.warn('Failed to adjust audio track constraints:', error);
-          }
+      if (captureMode !== 'browser') {
+        try {
+          await Promise.all(audioTracks.map(track => track.applyConstraints({
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false
+          })));
+        } catch (error) {
+          console.warn('Failed to adjust audio track constraints:', error);
         }
       }
+
+      // Start sending visualizer data to the popup
+      startAudioVisualizer(stream);
+    } else {
+      // Ensure visualizer is stopped when audio isn't active
+      stopAudioVisualizer();
     }
     
     // Apply video constraints
@@ -353,6 +432,7 @@ async function startRecording(streamId, captureMode, options) {
     console.error('Failed to start recording:', error);
     stopBufferMonitoring();
     stopLocalAudioPlayback();
+    stopAudioVisualizer();
     if (stream) {
       stream.getTracks().forEach(track => track.stop());
       stream = null;
@@ -366,6 +446,7 @@ async function stopRecording() {
     if (!mediaRecorder || mediaRecorder.state === 'inactive') {
       stopBufferMonitoring();
       stopLocalAudioPlayback();
+      stopAudioVisualizer();
       resolve();
       return;
     }
@@ -408,6 +489,7 @@ async function stopRecording() {
       }
 
       stopLocalAudioPlayback();
+      stopAudioVisualizer();
     };
     
     mediaRecorder.stop();

@@ -12,6 +12,9 @@ const statusDiv = document.getElementById('status');
 const timerDiv = document.getElementById('timer');
 const bufferSizeDiv = document.getElementById('bufferSize');
 const captureModeRadios = document.querySelectorAll('input[name="captureMode"]');
+const audioNoteDiv = document.getElementById('audioNote');
+const vizCanvas = document.getElementById('audioViz');
+const vizCtx = vizCanvas.getContext('2d');
 
 startBtn.addEventListener('click', startRecording);
 stopBtn.addEventListener('click', stopRecording);
@@ -79,11 +82,24 @@ async function startRecording() {
   try {
     statusDiv.textContent = 'Initializing...';
     statusDiv.className = 'status';
+    audioNoteDiv.textContent = '';
+    hideVisualizer();
     
     const fps = parseInt(fpsSelect.value);
     const includeAudio = audioCheckbox.checked;
     const captureMode = document.querySelector('input[name="captureMode"]:checked').value;
-    const tabId = captureMode === 'tab' ? parseInt(tabSelect.value) : null;
+    let tabId = null;
+    if (captureMode === 'tab') {
+      const raw = tabSelect.value;
+      const parsed = parseInt(raw, 10);
+      if (Number.isNaN(parsed)) {
+        // Fallback to active tab if dropdown value is not a number (e.g., 'current')
+        const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+        tabId = active?.id ?? null;
+      } else {
+        tabId = parsed;
+      }
+    }
     
     const response = await chrome.runtime.sendMessage({
       action: 'startCapture',
@@ -179,6 +195,8 @@ function resetUI() {
   timerDiv.classList.remove('active');
   bufferSizeDiv.textContent = '';
   bufferSizeDiv.classList.remove('warning');
+  audioNoteDiv.textContent = '';
+  hideVisualizer();
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -234,4 +252,46 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     startTime = message.startTime || Date.now();
     chrome.storage.local.set({ startTime: startTime });
   }
+
+  if (message.action === 'recordingWarning') {
+    audioNoteDiv.textContent = message.message || 'Recording without audio';
+  }
+
+  if (message.action === 'audioData' && Array.isArray(message.bars)) {
+    showVisualizer();
+    drawBars(message.bars);
+  }
 });
+
+function showVisualizer() {
+  vizCanvas.hidden = false;
+  // Clear once when shown
+  vizCtx.clearRect(0, 0, vizCanvas.width, vizCanvas.height);
+}
+
+function hideVisualizer() {
+  vizCanvas.hidden = true;
+  vizCtx.clearRect(0, 0, vizCanvas.width, vizCanvas.height);
+}
+
+function drawBars(bars) {
+  const w = vizCanvas.width;
+  const h = vizCanvas.height;
+  vizCtx.clearRect(0, 0, w, h);
+
+  const count = bars.length;
+  const gap = 2; // px between bars
+  const barWidth = Math.max(1, Math.floor((w - (count - 1) * gap) / count));
+
+  for (let i = 0; i < count; i++) {
+    const mag = Math.max(0, Math.min(255, bars[i] | 0));
+    const barHeight = Math.round((mag / 255) * (h - 2));
+    const x = i * (barWidth + gap);
+    const y = h - barHeight;
+
+    // Color from quiet (light gray) to loud (dark)
+    const shade = 110 + Math.round((mag / 255) * 100);
+    vizCtx.fillStyle = `rgb(${shade}, ${shade}, ${shade})`;
+    vizCtx.fillRect(x, y, barWidth, barHeight);
+  }
+}
