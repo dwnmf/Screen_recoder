@@ -1,12 +1,18 @@
 let timerInterval = null;
 let startTime = 0;
 let isRecording = false;
+let isPaused = false;
+let pauseStartTime = 0;
+let pausedDuration = 0;
+let countdownActive = false;
 
 const startBtn = document.getElementById('startBtn');
 const stopBtn = document.getElementById('stopBtn');
+const pauseBtn = document.getElementById('pauseBtn');
 const tabSelect = document.getElementById('tabSelect');
 const tabSelectGroup = document.getElementById('tabSelectGroup');
 const fpsSelect = document.getElementById('fps');
+const qualitySelect = document.getElementById('quality');
 const audioCheckbox = document.getElementById('audio');
 const statusDiv = document.getElementById('status');
 const timerDiv = document.getElementById('timer');
@@ -19,9 +25,16 @@ const chunkCheckbox = document.getElementById('chunkEnabled');
 const chunkOptions = document.getElementById('chunkOptions');
 const chunkSizeInput = document.getElementById('chunkSize');
 const chunkFolderInput = document.getElementById('chunkFolder');
+const countdownOverlay = document.getElementById('countdownOverlay');
+const countdownText = document.getElementById('countdownText');
+const pauseIcon = pauseBtn.querySelector('.icon-pause');
+const resumeIcon = pauseBtn.querySelector('.icon-resume');
+const pauseBtnLabel = pauseBtn.querySelector('.btn-label');
 
 startBtn.addEventListener('click', startRecording);
 stopBtn.addEventListener('click', stopRecording);
+pauseBtn.addEventListener('click', togglePause);
+qualitySelect.addEventListener('change', persistQualitySetting);
 
 captureModeRadios.forEach(radio => {
   radio.addEventListener('change', (e) => {
@@ -80,16 +93,35 @@ async function loadTabs() {
 
 async function checkRecordingStatus() {
   try {
-    const { isRecording: recording, startTime: savedStartTime } = await chrome.storage.local.get(['isRecording', 'startTime']);
-    
-    if (recording) {
+    const stored = await chrome.storage.local.get(['isRecording', 'startTime', 'isPaused', 'pauseStart', 'pausedDuration']);
+
+    if (stored.isRecording) {
       isRecording = true;
-      startTime = savedStartTime || Date.now();
+      startTime = typeof stored.startTime === 'number' && stored.startTime > 0 ? stored.startTime : Date.now();
+      pausedDuration = typeof stored.pausedDuration === 'number' && stored.pausedDuration > 0 ? stored.pausedDuration : 0;
+      const storedPauseStart = typeof stored.pauseStart === 'number' && stored.pauseStart > 0 ? stored.pauseStart : 0;
+      isPaused = !!stored.isPaused;
+      pauseStartTime = isPaused ? storedPauseStart || Date.now() : 0;
+
       setRecordingUI();
       updateTimer();
-      timerInterval = setInterval(updateTimer, 1000);
+      if (timerInterval) {
+        clearInterval(timerInterval);
+      }
+      if (!isPaused) {
+        timerInterval = setInterval(updateTimer, 1000);
+      }
     } else {
+      isRecording = false;
+      isPaused = false;
+      pauseStartTime = 0;
+      pausedDuration = 0;
+      if (timerInterval) {
+        clearInterval(timerInterval);
+        timerInterval = null;
+      }
       setChunkControlsDisabled(false);
+      updatePauseUI();
     }
   } catch (error) {
     console.error('Failed to check status:', error);
@@ -101,14 +133,22 @@ loadTabs();
 checkRecordingStatus();
 
 async function startRecording() {
+  if (isRecording || countdownActive) {
+    return;
+  }
+
   try {
-    statusDiv.textContent = 'Initializing...';
+    statusDiv.textContent = '';
     statusDiv.className = 'status';
     audioNoteDiv.textContent = '';
     hideVisualizer();
+
+    await runCountdown(3);
+    statusDiv.textContent = 'Initializing...';
     
-    const fps = parseInt(fpsSelect.value);
+    const fps = parseInt(fpsSelect.value, 10) || 30;
     const includeAudio = audioCheckbox.checked;
+    const videoBitsPerSecond = parseVideoBitrate();
     const captureMode = document.querySelector('input[name="captureMode"]:checked').value;
     const chunkEnabled = chunkCheckbox.checked;
     const chunkSizeMB = normalizeChunkSizeInput();
@@ -121,6 +161,10 @@ async function startRecording() {
 
     if (chunkFolderInput.value !== chunkFolder) {
       chunkFolderInput.value = chunkFolder;
+    }
+    const bitrateValue = String(videoBitsPerSecond);
+    if (qualitySelect.value !== bitrateValue) {
+      qualitySelect.value = bitrateValue;
     }
 
     let tabId = null;
@@ -153,6 +197,7 @@ async function startRecording() {
         targetTabId: targetTabId,
         fps: fps,
         includeAudio: includeAudio,
+        videoBitsPerSecond: videoBitsPerSecond,
         chunk: chunkOptionsPayload
       });
     } else {
@@ -163,6 +208,7 @@ async function startRecording() {
         targetTabId: targetTabId,
         fps: fps,
         includeAudio: includeAudio,
+        videoBitsPerSecond: videoBitsPerSecond,
         chunk: chunkOptionsPayload
       });
     }
@@ -172,13 +218,25 @@ async function startRecording() {
     }
     
     isRecording = true;
+    isPaused = false;
     startTime = Date.now();
+    pauseStartTime = 0;
+    pausedDuration = 0;
+
+    if (timerInterval) {
+      clearInterval(timerInterval);
+      timerInterval = null;
+    }
     
     await chrome.storage.local.set({
       isRecording: true,
       startTime: startTime,
       fps: fps,
       includeAudio: includeAudio,
+      isPaused: false,
+      pauseStart: null,
+      pausedDuration: 0,
+      videoBitsPerSecond: videoBitsPerSecond,
       chunkEnabled: chunkEnabled,
       chunkSizeMB: chunkSizeMB,
       chunkFolder: chunkFolder
@@ -193,27 +251,196 @@ async function startRecording() {
     statusDiv.textContent = 'Error: ' + error.message;
     statusDiv.className = 'status error';
     resetUI();
+  } finally {
+    countdownActive = false;
+    hideCountdownOverlay();
+  }
+}
+
+function parseVideoBitrate() {
+  const parsed = parseInt(qualitySelect.value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 2500000;
+  }
+  return parsed;
+}
+
+function persistQualitySetting() {
+  chrome.storage.local.set({
+    videoBitsPerSecond: parseVideoBitrate()
+  }).catch(() => {});
+}
+
+function delay(ms) {
+  return new Promise(resolve => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function runCountdown(seconds = 3) {
+  const duration = Number.isFinite(seconds) && seconds > 0 ? Math.floor(seconds) : 0;
+  if (duration <= 0) {
+    hideCountdownOverlay();
+    return;
+  }
+
+  countdownActive = true;
+  startBtn.disabled = true;
+  stopBtn.disabled = true;
+  pauseBtn.disabled = true;
+  countdownOverlay.hidden = false;
+
+  // Allow CSS transition to apply after display change
+  requestAnimationFrame(() => {
+    countdownOverlay.classList.add('active');
+  });
+
+  for (let remaining = duration; remaining > 0; remaining -= 1) {
+    countdownText.textContent = String(remaining);
+    statusDiv.textContent = `Starting in ${remaining}...`;
+    statusDiv.className = 'status';
+    await delay(1000);
+  }
+
+  countdownOverlay.classList.remove('active');
+  await delay(200);
+  countdownOverlay.hidden = true;
+  countdownActive = false;
+}
+
+function hideCountdownOverlay() {
+  countdownOverlay.classList.remove('active');
+  countdownOverlay.hidden = true;
+}
+
+async function togglePause() {
+  if (!isRecording || countdownActive) {
+    return;
+  }
+
+  pauseBtn.disabled = true;
+
+  try {
+    if (!isPaused) {
+      const response = await chrome.runtime.sendMessage({ action: 'pauseCapture' });
+      if (!response?.success) {
+        throw new Error(response?.error || 'Failed to pause recording');
+      }
+      applyPauseState(Date.now());
+    } else {
+      const response = await chrome.runtime.sendMessage({ action: 'resumeCapture' });
+      if (!response?.success) {
+        throw new Error(response?.error || 'Failed to resume recording');
+      }
+      applyResumeState(Date.now());
+    }
+  } catch (error) {
+    console.error('Pause toggle error:', error);
+    statusDiv.textContent = 'Error: ' + error.message;
+    statusDiv.className = 'status error';
+  } finally {
+    if (isRecording) {
+      pauseBtn.disabled = false;
+    }
+  }
+}
+
+function applyPauseState(pauseTimestamp) {
+  if (!isRecording || isPaused) {
+    return;
+  }
+
+  isPaused = true;
+  pauseStartTime = typeof pauseTimestamp === 'number' && pauseTimestamp > 0 ? pauseTimestamp : Date.now();
+
+  if (timerInterval) {
+    clearInterval(timerInterval);
+    timerInterval = null;
+  }
+
+  updateTimer();
+  setRecordingUI();
+
+  chrome.storage.local.set({
+    isPaused: true,
+    pauseStart: pauseStartTime,
+    pausedDuration: pausedDuration
+  }).catch(() => {});
+}
+
+function applyResumeState(resumeTimestamp) {
+  if (!isRecording || !isPaused) {
+    return;
+  }
+
+  const resumeTime = typeof resumeTimestamp === 'number' && resumeTimestamp > 0 ? resumeTimestamp : Date.now();
+  if (pauseStartTime) {
+    pausedDuration += Math.max(0, resumeTime - pauseStartTime);
+  }
+
+  isPaused = false;
+  pauseStartTime = 0;
+
+  if (timerInterval) {
+    clearInterval(timerInterval);
+    timerInterval = null;
+  }
+
+  updateTimer();
+  setRecordingUI();
+  timerInterval = setInterval(updateTimer, 1000);
+
+  chrome.storage.local.set({
+    isPaused: false,
+    pauseStart: null,
+    pausedDuration: pausedDuration
+  }).catch(() => {});
+}
+
+function updatePauseUI() {
+  pauseBtn.disabled = !isRecording;
+  pauseBtn.classList.toggle('resume', isPaused);
+  if (pauseBtnLabel) {
+    pauseBtnLabel.textContent = isPaused ? 'Resume' : 'Pause';
+  }
+  if (pauseIcon) {
+    pauseIcon.hidden = isPaused;
+  }
+  if (resumeIcon) {
+    resumeIcon.hidden = !isPaused;
   }
 }
 
 function setRecordingUI() {
   startBtn.disabled = true;
   stopBtn.disabled = false;
+  pauseBtn.disabled = false;
   tabSelect.disabled = true;
   fpsSelect.disabled = true;
+  qualitySelect.disabled = true;
   audioCheckbox.disabled = true;
   captureModeRadios.forEach(radio => radio.disabled = true);
   setChunkControlsDisabled(true);
   
-  statusDiv.textContent = '● Recording...';
-  statusDiv.className = 'status recording';
-  timerDiv.classList.add('active');
+  if (isPaused) {
+    statusDiv.textContent = '⏸ Paused';
+    statusDiv.className = 'status paused';
+    timerDiv.classList.remove('active');
+  } else {
+    statusDiv.textContent = '● Recording...';
+    statusDiv.className = 'status recording';
+    timerDiv.classList.add('active');
+  }
+
+  updatePauseUI();
 }
 
 async function stopRecording() {
   try {
     statusDiv.textContent = 'Processing...';
     statusDiv.className = 'status';
+    stopBtn.disabled = true;
+    pauseBtn.disabled = true;
     
     const response = await chrome.runtime.sendMessage({
       action: 'stopCapture'
@@ -229,28 +456,56 @@ async function stopRecording() {
     }
     
     isRecording = false;
-    await chrome.storage.local.set({ isRecording: false });
+    isPaused = false;
+    pauseStartTime = 0;
+    pausedDuration = 0;
+    await chrome.storage.local.set({
+      isRecording: false,
+      isPaused: false,
+      pauseStart: null,
+      pausedDuration: 0
+    });
     
   } catch (error) {
     console.error('Stop recording error:', error);
     statusDiv.textContent = 'Error: ' + error.message;
     statusDiv.className = 'status error';
     resetUI();
+  } finally {
+    if (!isRecording) {
+      stopBtn.disabled = true;
+    }
   }
 }
 
 function updateTimer() {
-  const elapsed = Math.floor((Date.now() - startTime) / 1000);
+  if (!startTime || startTime <= 0) {
+    timerDiv.textContent = '00:00';
+    return;
+  }
+
+  const reference = (isPaused && pauseStartTime) ? pauseStartTime : Date.now();
+  const elapsedMs = Math.max(0, reference - startTime - pausedDuration);
+  const elapsed = Math.floor(elapsedMs / 1000);
   const minutes = Math.floor(elapsed / 60).toString().padStart(2, '0');
   const seconds = (elapsed % 60).toString().padStart(2, '0');
   timerDiv.textContent = `${minutes}:${seconds}`;
 }
 
 function resetUI() {
+  isRecording = false;
+  isPaused = false;
+  startTime = 0;
+  pauseStartTime = 0;
+  pausedDuration = 0;
+  countdownActive = false;
+
   startBtn.disabled = false;
   stopBtn.disabled = true;
+  pauseBtn.disabled = true;
   tabSelect.disabled = false;
   fpsSelect.disabled = false;
+  qualitySelect.disabled = false;
   audioCheckbox.disabled = false;
   captureModeRadios.forEach(radio => radio.disabled = false);
   setChunkControlsDisabled(false);
@@ -260,6 +515,8 @@ function resetUI() {
   bufferSizeDiv.classList.remove('warning');
   audioNoteDiv.textContent = '';
   hideVisualizer();
+  hideCountdownOverlay();
+  updatePauseUI();
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -280,7 +537,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     
     isRecording = false;
-    chrome.storage.local.set({ isRecording: false });
+    isPaused = false;
+    pauseStartTime = 0;
+    pausedDuration = 0;
+    chrome.storage.local.set({
+      isRecording: false,
+      isPaused: false,
+      pauseStart: null,
+      pausedDuration: 0
+    });
     
     resetUI();
     
@@ -310,7 +575,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     
     isRecording = false;
-    chrome.storage.local.set({ isRecording: false });
+    isPaused = false;
+    pauseStartTime = 0;
+    pausedDuration = 0;
+    chrome.storage.local.set({
+      isRecording: false,
+      isPaused: false,
+      pauseStart: null,
+      pausedDuration: 0
+    });
     
     resetUI();
     statusDiv.textContent = 'Error: ' + (message.error || 'Recording error');
@@ -319,7 +592,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   
   if (message.action === 'recordingStarted') {
     startTime = message.startTime || Date.now();
-    chrome.storage.local.set({ startTime: startTime });
+    pausedDuration = 0;
+    pauseStartTime = 0;
+    isPaused = false;
+    chrome.storage.local.set({
+      startTime: startTime,
+      isPaused: false,
+      pauseStart: null,
+      pausedDuration: 0
+    });
+    if (!timerInterval) {
+      timerInterval = setInterval(updateTimer, 1000);
+    }
+    setRecordingUI();
+  }
+
+  if (message.action === 'recordingPaused') {
+    applyPauseState(typeof message.pauseTime === 'number' ? message.pauseTime : Date.now());
+  }
+
+  if (message.action === 'recordingResumed') {
+    applyResumeState(typeof message.resumeTime === 'number' ? message.resumeTime : Date.now());
   }
 
   if (message.action === 'recordingWarning') {
@@ -370,19 +663,25 @@ async function initializeSettings() {
     const stored = await chrome.storage.local.get({
       chunkEnabled: false,
       chunkSizeMB: 100,
-      chunkFolder: ''
+      chunkFolder: '',
+      videoBitsPerSecond: 2500000
     });
 
     chunkCheckbox.checked = !!stored.chunkEnabled;
     chunkSizeInput.value = normalizeChunkSizeInput(stored.chunkSizeMB);
     chunkFolderInput.value = sanitizeFolderValue(stored.chunkFolder);
     toggleChunkOptions(chunkCheckbox.checked);
+
+    const storedBitrate = Number(stored.videoBitsPerSecond) || 2500000;
+    const bitrateOption = Array.from(qualitySelect.options).find(option => Number(option.value) === storedBitrate);
+    qualitySelect.value = bitrateOption ? bitrateOption.value : '2500000';
   } catch (error) {
     console.error('Failed to load settings:', error);
     chunkCheckbox.checked = false;
     chunkSizeInput.value = 100;
     chunkFolderInput.value = '';
     toggleChunkOptions(false);
+    qualitySelect.value = '2500000';
   }
 }
 

@@ -64,6 +64,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .catch(error => sendResponse({ success: false, error: error.message }));
     return true;
   }
+
+  if (message.action === 'pauseCapture') {
+    chrome.runtime.sendMessage({ action: 'pauseRecording' })
+      .then(() => sendResponse({ success: true }))
+      .catch(error => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+
+  if (message.action === 'resumeCapture') {
+    chrome.runtime.sendMessage({ action: 'resumeRecording' })
+      .then(() => sendResponse({ success: true }))
+      .catch(error => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
   
   if (message.action === 'startCaptureWithStreamId') {
     handleStartWithProvidedStreamId(message)
@@ -101,6 +115,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       message.action === 'recordingComplete' || 
       message.action === 'recordingError' ||
       message.action === 'recordingStarted' ||
+      message.action === 'recordingPaused' ||
+      message.action === 'recordingResumed' ||
       message.action === 'recordingWarning' ||
       message.action === 'audioData') {
     chrome.runtime.sendMessage(message).catch(() => {});
@@ -192,6 +208,7 @@ async function handleStartCapture(options, sender) {
       options: {
         fps: options.fps,
         includeAudio: allowAudio,
+        videoBitsPerSecond: options.videoBitsPerSecond,
         chunk: options.chunk
       }
     });
@@ -217,6 +234,7 @@ async function handleStartWithProvidedStreamId(payload) {
       options: {
         fps: payload.fps,
         includeAudio: !!payload.includeAudio,
+        videoBitsPerSecond: payload.videoBitsPerSecond,
         chunk: payload.chunk
       }
     });

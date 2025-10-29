@@ -2,6 +2,7 @@ let mediaRecorder = null;
 let recordedChunks = [];
 let stream = null;
 let startTime = 0;
+let pauseTimestamp = 0;
 let bufferSizeInterval = null;
 let currentBufferSize = 0;
 let audioPlaybackElement = null;
@@ -294,12 +295,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .catch(error => sendResponse({ success: false, error: error.message }));
     return true;
   }
+
+  if (message.action === 'pauseRecording') {
+    pauseRecording()
+      .then(() => sendResponse({ success: true }))
+      .catch(error => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+
+  if (message.action === 'resumeRecording') {
+    resumeRecording()
+      .then(() => sendResponse({ success: true }))
+      .catch(error => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
   
   if (message.action === 'getStatus') {
     sendResponse({
       isRecording: mediaRecorder && mediaRecorder.state === 'recording',
+      isPaused: mediaRecorder && mediaRecorder.state === 'paused',
       startTime: startTime,
-      bufferSize: currentBufferSize
+      bufferSize: currentBufferSize,
+      pauseTime: pauseTimestamp
     });
     return true;
   }
@@ -315,6 +332,7 @@ async function startRecording(streamId, captureMode, options) {
     recordingIdentifier = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
     chunkConfig = createChunkConfig(options.chunk, recordingIdentifier);
     resetRecorderBuffers();
+    pauseTimestamp = 0;
 
     // Validate streamId: required for tab capture; for desktop capture the
     // offscreen document may request it via chooseDesktopMedia below.
@@ -571,10 +589,17 @@ async function startRecording(streamId, captureMode, options) {
       }
     }
 
+    const requestedBitrate = Number(options.videoBitsPerSecond);
+    const videoBitsPerSecond = Number.isFinite(requestedBitrate) && requestedBitrate > 0
+      ? requestedBitrate
+      : 2500000;
+
     const recorderOptions = {
       mimeType: 'video/webm;codecs=vp9',
-      videoBitsPerSecond: 2500000
+      videoBitsPerSecond
     };
+    
+    console.log('Initializing MediaRecorder with bitrate:', videoBitsPerSecond);
     
     if (!MediaRecorder.isTypeSupported(recorderOptions.mimeType)) {
       recorderOptions.mimeType = 'video/webm;codecs=vp8';
@@ -605,6 +630,23 @@ async function startRecording(streamId, captureMode, options) {
       } catch (error) {
         console.error('Finalize recording error:', error);
       }
+    };
+
+    mediaRecorder.onpause = () => {
+      pauseTimestamp = Date.now();
+      chrome.runtime.sendMessage({
+        action: 'recordingPaused',
+        pauseTime: pauseTimestamp
+      }).catch(() => {});
+    };
+
+    mediaRecorder.onresume = () => {
+      const resumeTime = Date.now();
+      pauseTimestamp = 0;
+      chrome.runtime.sendMessage({
+        action: 'recordingResumed',
+        resumeTime
+      }).catch(() => {});
     };
     
     mediaRecorder.onerror = (error) => {
@@ -659,6 +701,7 @@ async function startRecording(streamId, captureMode, options) {
     chunkConfig = createDefaultChunkConfig('');
     recordingIdentifier = '';
     mediaRecorder = null;
+    pauseTimestamp = 0;
     throw error;
   }
 }
@@ -733,6 +776,7 @@ async function finalizeRecording() {
     recordingIdentifier = '';
     currentBufferSize = 0;
     startTime = 0;
+    pauseTimestamp = 0;
     if (stream) {
       stream.getTracks().forEach(track => track.stop());
       stream = null;
@@ -748,6 +792,7 @@ async function stopRecording() {
     stopBufferMonitoring();
     stopLocalAudioPlayback();
     stopAudioVisualizer();
+    pauseTimestamp = 0;
     return;
   }
 
@@ -769,4 +814,44 @@ async function stopRecording() {
       reject(error);
     }
   });
+}
+
+async function pauseRecording() {
+  if (!mediaRecorder) {
+    throw new Error('No active recording to pause');
+  }
+
+  if (mediaRecorder.state === 'paused') {
+    return;
+  }
+
+  if (mediaRecorder.state !== 'recording') {
+    throw new Error('Recorder is not in a recording state');
+  }
+
+  try {
+    mediaRecorder.pause();
+  } catch (error) {
+    throw error instanceof Error ? error : new Error(String(error));
+  }
+}
+
+async function resumeRecording() {
+  if (!mediaRecorder) {
+    throw new Error('No paused recording to resume');
+  }
+
+  if (mediaRecorder.state === 'recording') {
+    return;
+  }
+
+  if (mediaRecorder.state !== 'paused') {
+    throw new Error('Recorder is not paused');
+  }
+
+  try {
+    mediaRecorder.resume();
+  } catch (error) {
+    throw error instanceof Error ? error : new Error(String(error));
+  }
 }
