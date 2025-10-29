@@ -184,8 +184,14 @@ async function startRecording(streamId, captureMode, options) {
 
     // For desktop capture, allow the offscreen document to invoke the picker
     // so that the resulting streamId is consumed in the same document.
-    if (captureMode === 'browser' && !streamId) {
-      const wantAudio = !!options.includeAudio;
+    const mediaSource = captureMode === 'browser' ? 'desktop' : 'tab';
+
+    async function ensureStreamId(currentStreamId, allowAudio) {
+      if (captureMode !== 'browser' || currentStreamId) {
+        return { streamId: currentStreamId, audioAllowed: allowAudio };
+      }
+
+      const wantAudio = !!allowAudio;
       const sources = ['window', 'screen'];
       if (wantAudio) sources.push('audio');
 
@@ -210,22 +216,22 @@ async function startRecording(streamId, captureMode, options) {
         } catch (e) { reject(e); }
       });
 
-      streamId = result.chosenStreamId;
       if (wantAudio && !result.canRequestAudio) {
-        options.includeAudio = false;
         chrome.runtime.sendMessage({ action: 'recordingWarning', message: 'Recording without audio' }).catch(() => {});
+        options.includeAudio = false;
+        return { streamId: result.chosenStreamId, audioAllowed: false };
       }
+
+      return { streamId: result.chosenStreamId, audioAllowed: allowAudio };
     }
 
-    const mediaSource = captureMode === 'browser' ? 'desktop' : 'tab';
-
-    function buildConstraints({ legacy, includeAudio }) {
+    function buildConstraints({ legacy, includeAudio, streamIdentifier }) {
       const c = {};
       // Video
       if (legacy) {
-        c.video = { mandatory: { chromeMediaSource: mediaSource, chromeMediaSourceId: streamId } };
+        c.video = { mandatory: { chromeMediaSource: mediaSource, chromeMediaSourceId: streamIdentifier } };
       } else {
-        c.video = { chromeMediaSource: mediaSource, chromeMediaSourceId: streamId };
+        c.video = { chromeMediaSource: mediaSource, chromeMediaSourceId: streamIdentifier };
       }
       // Audio (omit property entirely if not requested)
       if (includeAudio) {
@@ -233,13 +239,13 @@ async function startRecording(streamId, captureMode, options) {
           c.audio = {
             mandatory: {
               chromeMediaSource: mediaSource,
-              chromeMediaSourceId: streamId
+              chromeMediaSourceId: streamIdentifier
             }
           };
         } else {
           c.audio = {
             chromeMediaSource: mediaSource,
-            chromeMediaSourceId: streamId
+            chromeMediaSourceId: streamIdentifier
           };
           // Experimental: keep tab audio audible during capture in tab mode
           if (captureMode === 'tab') {
@@ -251,81 +257,108 @@ async function startRecording(streamId, captureMode, options) {
     }
 
     // Try order: desktop prefers legacy first; tab prefers modern first
-    const constraintsToTry = [];
-    if (captureMode === 'browser') {
-      constraintsToTry.push(buildConstraints({ legacy: true, includeAudio: !!options.includeAudio }));
-      constraintsToTry.push(buildConstraints({ legacy: false, includeAudio: !!options.includeAudio }));
-    } else {
-      constraintsToTry.push(buildConstraints({ legacy: false, includeAudio: !!options.includeAudio }));
-      constraintsToTry.push(buildConstraints({ legacy: true, includeAudio: !!options.includeAudio }));
-    }
+    const constraintsToTryBase = captureMode === 'browser'
+      ? [
+          (streamIdentifier, includeAudio) => buildConstraints({ legacy: true, includeAudio, streamIdentifier }),
+          (streamIdentifier, includeAudio) => buildConstraints({ legacy: false, includeAudio, streamIdentifier })
+        ]
+      : [
+          (streamIdentifier, includeAudio) => buildConstraints({ legacy: false, includeAudio, streamIdentifier }),
+          (streamIdentifier, includeAudio) => buildConstraints({ legacy: true, includeAudio, streamIdentifier })
+        ];
 
     let lastError = null;
     let tryWithoutAudio = false;
-    
-    for (const constraints of constraintsToTry) {
-      try {
-        console.log('Trying getUserMedia with constraints:', constraints);
-        stream = await navigator.mediaDevices.getUserMedia(constraints);
-        console.log('Successfully got media stream');
-        lastError = null;
-        break;
-      } catch (err) {
-        console.error('getUserMedia failed:', err);
-        lastError = err;
-        const isNotFound = err.name === 'NotFoundError' || /Requested device not found/i.test(err.message || '');
-        const isPermissionDenied = err.name === 'NotAllowedError' || /permission/i.test(err.message || '');
-        const isAbortInvalidState = (err.name === 'AbortError' && /Invalid state/i.test(err.message || '')) || /Invalid state/i.test(err.message || '');
+    let streamIdToUse = streamId;
+    let audioAllowed = !!options.includeAudio;
+    let retriedWithFreshStreamId = false;
 
-        if (isPermissionDenied) {
-          throw new Error('Permission denied. Please allow screen capture access.');
-        }
+    while (!stream) {
+      const ensured = await ensureStreamId(streamIdToUse, audioAllowed);
+      streamIdToUse = ensured.streamId;
+      audioAllowed = ensured.audioAllowed;
 
-        // Some Chrome versions transiently throw AbortError: Invalid state — wait and retry once
-        if (isAbortInvalidState) {
-          try {
-            await new Promise(r => setTimeout(r, 150));
-            console.warn('Retrying getUserMedia after AbortError Invalid state...');
-            stream = await navigator.mediaDevices.getUserMedia(constraints);
-            console.log('Successfully got media stream after retry');
-            lastError = null;
-            break;
-          } catch (retryErr) {
-            console.error('Retry after AbortError also failed:', retryErr);
-            lastError = retryErr;
+      const constraintsToTry = constraintsToTryBase.map(fn => fn(streamIdToUse, audioAllowed));
+
+      for (const constraints of constraintsToTry) {
+        try {
+          console.log('Trying getUserMedia with constraints:', constraints);
+          stream = await navigator.mediaDevices.getUserMedia(constraints);
+          console.log('Successfully got media stream');
+          lastError = null;
+          break;
+        } catch (err) {
+          console.error('getUserMedia failed:', err);
+          lastError = err;
+          const isNotFound = err.name === 'NotFoundError' || /Requested device not found/i.test(err.message || '');
+          const isPermissionDenied = err.name === 'NotAllowedError' || /permission/i.test(err.message || '');
+          const isAbortInvalidState = (err.name === 'AbortError' && /Invalid state/i.test(err.message || '')) || /Invalid state/i.test(err.message || '');
+
+          if (isPermissionDenied) {
+            throw new Error('Permission denied. Please allow screen capture access.');
           }
-        }
 
-        // If audio seems to be the culprit, try without audio
-        if (options.includeAudio && (isNotFound || isAbortInvalidState) && !tryWithoutAudio) {
-          console.warn('Audio device not found, retrying without audio');
-          tryWithoutAudio = true;
-          try {
-            const retryConstraints = JSON.parse(JSON.stringify(constraints));
-            // Remove audio entirely
-            delete retryConstraints.audio;
-            console.log('Retry constraints without audio:', retryConstraints);
-            stream = await navigator.mediaDevices.getUserMedia(retryConstraints);
-            console.log('Successfully got media stream without audio');
-            options.includeAudio = false;
-            chrome.runtime.sendMessage({ action: 'recordingWarning', message: 'Recording without audio' }).catch(() => {});
-            lastError = null;
-            break;
-          } catch (retryErr) {
-            console.error('Retry without audio also failed:', retryErr);
-            lastError = retryErr;
+          // Some Chrome versions transiently throw AbortError: Invalid state — wait and retry once
+          if (isAbortInvalidState) {
+            try {
+              await new Promise(r => setTimeout(r, 150));
+              console.warn('Retrying getUserMedia after AbortError Invalid state...');
+              stream = await navigator.mediaDevices.getUserMedia(constraints);
+              console.log('Successfully got media stream after retry');
+              lastError = null;
+              break;
+            } catch (retryErr) {
+              console.error('Retry after AbortError also failed:', retryErr);
+              lastError = retryErr;
+            }
           }
+
+          // If audio seems to be the culprit, try without audio
+          if (audioAllowed && (isNotFound || isAbortInvalidState) && !tryWithoutAudio) {
+            console.warn('Audio device not found, retrying without audio');
+            tryWithoutAudio = true;
+            try {
+              const retryConstraints = JSON.parse(JSON.stringify(constraints));
+              // Remove audio entirely
+              delete retryConstraints.audio;
+              console.log('Retry constraints without audio:', retryConstraints);
+              stream = await navigator.mediaDevices.getUserMedia(retryConstraints);
+              console.log('Successfully got media stream without audio');
+              options.includeAudio = false;
+              audioAllowed = false;
+              chrome.runtime.sendMessage({ action: 'recordingWarning', message: 'Recording without audio' }).catch(() => {});
+              lastError = null;
+              break;
+            } catch (retryErr) {
+              console.error('Retry without audio also failed:', retryErr);
+              lastError = retryErr;
+            }
+          }
+          // Continue to next variant
         }
-        // Continue to next variant
       }
-    }
-    
-    if (!stream) {
-      const tried = constraintsToTry.map(c => Object.keys(c).join('+')).join(' | ');
-      const errorMsg = lastError ? `${lastError.name}: ${lastError.message} (mode=${captureMode}, tried=${tried})` : 'Failed to acquire capture stream';
+
+      if (stream) {
+        break;
+      }
+
+      const triedKeys = constraintsToTry.map(c => Object.keys(c).join('+')).join(' | ');
+      const isStreamInvalid = lastError && (lastError.name === 'NotFoundError' || /Requested device not found/i.test(lastError.message || ''));
+
+      if (captureMode === 'browser' && isStreamInvalid && !retriedWithFreshStreamId) {
+        console.warn('Stream ID appears invalid, requesting a new selection and retrying capture.');
+        retriedWithFreshStreamId = true;
+        streamIdToUse = null;
+        tryWithoutAudio = false;
+        continue;
+      }
+
+      const errorMsg = lastError ? `${lastError.name}: ${lastError.message} (mode=${captureMode}, tried=${triedKeys})` : 'Failed to acquire capture stream';
       console.error('All getUserMedia attempts failed:', errorMsg);
       throw new Error(errorMsg);
     }
+
+    streamId = streamIdToUse;
 
     const videoTrack = stream.getVideoTracks()[0];
     const audioTracks = stream.getAudioTracks();
