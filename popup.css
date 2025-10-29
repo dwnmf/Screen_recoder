@@ -52,7 +52,9 @@ h1 {
 }
 
 #tabSelect,
-#fps {
+#fps,
+#chunkSize,
+#chunkFolder {
   width: 100%;
   padding: 11px 14px;
   font-size: 13px;
@@ -66,20 +68,26 @@ h1 {
 }
 
 #tabSelect:hover,
-#fps:hover {
+#fps:hover,
+#chunkSize:hover,
+#chunkFolder:hover {
   border-color: #a3a3a3;
   background: #fafafa;
 }
 
 #tabSelect:focus,
-#fps:focus {
+#fps:focus,
+#chunkSize:focus,
+#chunkFolder:focus {
   outline: none;
   border-color: #525252;
   background: #ffffff;
 }
 
 #tabSelect:disabled,
-#fps:disabled {
+#fps:disabled,
+#chunkSize:disabled,
+#chunkFolder:disabled {
   opacity: 0.5;
   cursor: not-allowed;
   background: #f5f5f5;
@@ -142,6 +150,32 @@ h1 {
   font-size: 13px;
   color: #525252;
   letter-spacing: 0.2px;
+}
+
+.setting-group.nested {
+  padding: 14px 16px;
+  background: #f8f8f8;
+  border: 1px solid #eaeaea;
+  border-radius: 4px;
+}
+
+.setting-group.nested .sub-setting {
+  margin-bottom: 16px;
+}
+
+.setting-group.nested .sub-setting:last-child {
+  margin-bottom: 0;
+}
+
+.field-note {
+  font-size: 11px;
+  color: #888888;
+  margin-top: 6px;
+  line-height: 1.4;
+}
+
+#chunkFolder::placeholder {
+  color: #aaaaaa;
 }
 
 .controls {

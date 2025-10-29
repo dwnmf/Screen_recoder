@@ -48,6 +48,25 @@
           <span>Record audio</span>
         </label>
       </div>
+
+      <div class="setting-group">
+        <label class="checkbox-label">
+          <input type="checkbox" id="chunkEnabled">
+          <span>Save recording in chunks</span>
+        </label>
+      </div>
+
+      <div class="setting-group nested" id="chunkOptions" hidden>
+        <div class="sub-setting">
+          <label for="chunkSize">Chunk size (MB)</label>
+          <input type="number" id="chunkSize" min="10" max="2048" step="10" value="100">
+        </div>
+        <div class="sub-setting">
+          <label for="chunkFolder">Target folder</label>
+          <input type="text" id="chunkFolder" placeholder="recordings">
+          <p class="field-note">Folder is created inside your Downloads directory.</p>
+        </div>
+      </div>
     </div>
 
     <div class="controls">

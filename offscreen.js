@@ -10,8 +10,20 @@ let analyserNode = null;
 let visualizerInterval = null;
 const MAX_BUFFER_SIZE = 500 * 1024 * 1024;
 const WARNING_BUFFER_SIZE = 400 * 1024 * 1024;
+const MIN_CHUNK_SIZE_MB = 10;
+const MAX_CHUNK_SIZE_MB = 2048;
+const DEFAULT_CHUNK_SIZE_MB = 100;
+
+let chunkConfig = createDefaultChunkConfig('');
+let chunkBufferSize = 0;
+let chunkFlushPromise = Promise.resolve();
+let lastChunkError = null;
+let recordingIdentifier = '';
 
 function calculateBufferSize() {
+  if (chunkConfig.enabled) {
+    return chunkBufferSize;
+  }
   return recordedChunks.reduce((total, chunk) => total + chunk.size, 0);
 }
 
@@ -21,6 +33,131 @@ function formatBytes(bytes) {
   const sizes = ['B', 'KB', 'MB', 'GB'];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i];
+}
+
+function createDefaultChunkConfig(recordingId = '') {
+  const base = recordingId ? `recording_${recordingId}` : 'recording';
+  return {
+    enabled: false,
+    sizeBytes: 0,
+    folder: '',
+    baseName: base,
+    nextIndex: 1,
+    requireSaveAs: true,
+    savedChunks: 0
+  };
+}
+
+function sanitizeFolderPath(raw) {
+  if (!raw) {
+    return '';
+  }
+
+  return String(raw)
+    .replace(/\\/g, '/')
+    .split('/')
+    .map(part => part.trim())
+    .filter(part => part && part !== '..')
+    .map(part => part.replace(/\s+/g, ' ').replace(/[^a-zA-Z0-9 _.\-]/g, '_'))
+    .join('/');
+}
+
+function createChunkConfig(rawOptions, recordingId) {
+  const config = createDefaultChunkConfig(recordingId);
+  if (!rawOptions || !rawOptions.enabled) {
+    return config;
+  }
+
+  let sizeMB = parseInt(rawOptions.sizeMB, 10);
+  if (!Number.isFinite(sizeMB)) {
+    sizeMB = DEFAULT_CHUNK_SIZE_MB;
+  }
+  sizeMB = Math.min(Math.max(sizeMB, MIN_CHUNK_SIZE_MB), MAX_CHUNK_SIZE_MB);
+
+  config.enabled = true;
+  config.sizeBytes = sizeMB * 1024 * 1024;
+  config.folder = sanitizeFolderPath(rawOptions.folder);
+  config.requireSaveAs = false;
+  return config;
+}
+
+function resetRecorderBuffers() {
+  recordedChunks = [];
+  chunkBufferSize = 0;
+  chunkFlushPromise = Promise.resolve();
+  lastChunkError = null;
+}
+
+function chunkArraySize(chunks) {
+  return chunks.reduce((total, chunk) => total + (chunk?.size || 0), 0);
+}
+
+async function flushChunk(force = false) {
+  if (!chunkConfig.enabled) {
+    return;
+  }
+
+  if (!force && chunkBufferSize < chunkConfig.sizeBytes) {
+    return;
+  }
+
+  if (!recordedChunks.length) {
+    return;
+  }
+
+  const chunksToWrite = recordedChunks;
+  recordedChunks = [];
+  chunkBufferSize = 0;
+
+  const blob = new Blob(chunksToWrite, { type: 'video/webm' });
+  if (!blob.size) {
+    recordedChunks = chunksToWrite.concat(recordedChunks);
+    chunkBufferSize = chunkArraySize(recordedChunks);
+    return;
+  }
+
+  const url = URL.createObjectURL(blob);
+  const index = chunkConfig.nextIndex++;
+  const suffix = String(index).padStart(3, '0');
+  const folderPrefix = chunkConfig.folder ? `${chunkConfig.folder}/` : '';
+  const filename = `${folderPrefix}${chunkConfig.baseName}_part${suffix}.webm`;
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      action: 'saveRecording',
+      url,
+      filename,
+      saveAs: chunkConfig.requireSaveAs,
+      conflictAction: 'uniquify'
+    });
+
+    if (!response || !response.success) {
+      throw new Error(response?.error || 'Failed to save chunk');
+    }
+
+    chunkConfig.requireSaveAs = false;
+    chunkConfig.savedChunks = index;
+  } catch (error) {
+    recordedChunks = chunksToWrite.concat(recordedChunks);
+    chunkBufferSize = chunkArraySize(recordedChunks);
+    throw error;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+function queueChunkFlush(force = false) {
+  chunkFlushPromise = chunkFlushPromise
+    .then(() => flushChunk(force))
+    .catch(error => {
+      lastChunkError = error;
+      console.error('Failed to save recording chunk:', error);
+      chrome.runtime.sendMessage({
+        action: 'recordingError',
+        error: error?.message ? `Chunk save failed: ${error.message}` : 'Chunk save failed'
+      }).catch(() => {});
+    });
+  return chunkFlushPromise;
 }
 
 function startBufferMonitoring() {
@@ -174,6 +311,11 @@ async function startRecording(streamId, captureMode, options) {
       throw new Error('Recording already in progress');
     }
 
+    options = options || {};
+    recordingIdentifier = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+    chunkConfig = createChunkConfig(options.chunk, recordingIdentifier);
+    resetRecorderBuffers();
+
     // Validate streamId: required for tab capture; for desktop capture the
     // offscreen document may request it via chooseDesktopMedia below.
     if (!streamId && captureMode !== 'browser') {
@@ -184,8 +326,14 @@ async function startRecording(streamId, captureMode, options) {
 
     // For desktop capture, allow the offscreen document to invoke the picker
     // so that the resulting streamId is consumed in the same document.
-    if (captureMode === 'browser' && !streamId) {
-      const wantAudio = !!options.includeAudio;
+    const mediaSource = captureMode === 'browser' ? 'desktop' : 'tab';
+
+    async function ensureStreamId(currentStreamId, allowAudio) {
+      if (captureMode !== 'browser' || currentStreamId) {
+        return { streamId: currentStreamId, audioAllowed: allowAudio };
+      }
+
+      const wantAudio = !!allowAudio;
       const sources = ['window', 'screen'];
       if (wantAudio) sources.push('audio');
 
@@ -210,22 +358,22 @@ async function startRecording(streamId, captureMode, options) {
         } catch (e) { reject(e); }
       });
 
-      streamId = result.chosenStreamId;
       if (wantAudio && !result.canRequestAudio) {
-        options.includeAudio = false;
         chrome.runtime.sendMessage({ action: 'recordingWarning', message: 'Recording without audio' }).catch(() => {});
+        options.includeAudio = false;
+        return { streamId: result.chosenStreamId, audioAllowed: false };
       }
+
+      return { streamId: result.chosenStreamId, audioAllowed: allowAudio };
     }
 
-    const mediaSource = captureMode === 'browser' ? 'desktop' : 'tab';
-
-    function buildConstraints({ legacy, includeAudio }) {
+    function buildConstraints({ legacy, includeAudio, streamIdentifier }) {
       const c = {};
       // Video
       if (legacy) {
-        c.video = { mandatory: { chromeMediaSource: mediaSource, chromeMediaSourceId: streamId } };
+        c.video = { mandatory: { chromeMediaSource: mediaSource, chromeMediaSourceId: streamIdentifier } };
       } else {
-        c.video = { chromeMediaSource: mediaSource, chromeMediaSourceId: streamId };
+        c.video = { chromeMediaSource: mediaSource, chromeMediaSourceId: streamIdentifier };
       }
       // Audio (omit property entirely if not requested)
       if (includeAudio) {
@@ -233,13 +381,13 @@ async function startRecording(streamId, captureMode, options) {
           c.audio = {
             mandatory: {
               chromeMediaSource: mediaSource,
-              chromeMediaSourceId: streamId
+              chromeMediaSourceId: streamIdentifier
             }
           };
         } else {
           c.audio = {
             chromeMediaSource: mediaSource,
-            chromeMediaSourceId: streamId
+            chromeMediaSourceId: streamIdentifier
           };
           // Experimental: keep tab audio audible during capture in tab mode
           if (captureMode === 'tab') {
@@ -251,81 +399,108 @@ async function startRecording(streamId, captureMode, options) {
     }
 
     // Try order: desktop prefers legacy first; tab prefers modern first
-    const constraintsToTry = [];
-    if (captureMode === 'browser') {
-      constraintsToTry.push(buildConstraints({ legacy: true, includeAudio: !!options.includeAudio }));
-      constraintsToTry.push(buildConstraints({ legacy: false, includeAudio: !!options.includeAudio }));
-    } else {
-      constraintsToTry.push(buildConstraints({ legacy: false, includeAudio: !!options.includeAudio }));
-      constraintsToTry.push(buildConstraints({ legacy: true, includeAudio: !!options.includeAudio }));
-    }
+    const constraintsToTryBase = captureMode === 'browser'
+      ? [
+          (streamIdentifier, includeAudio) => buildConstraints({ legacy: true, includeAudio, streamIdentifier }),
+          (streamIdentifier, includeAudio) => buildConstraints({ legacy: false, includeAudio, streamIdentifier })
+        ]
+      : [
+          (streamIdentifier, includeAudio) => buildConstraints({ legacy: false, includeAudio, streamIdentifier }),
+          (streamIdentifier, includeAudio) => buildConstraints({ legacy: true, includeAudio, streamIdentifier })
+        ];
 
     let lastError = null;
     let tryWithoutAudio = false;
-    
-    for (const constraints of constraintsToTry) {
-      try {
-        console.log('Trying getUserMedia with constraints:', constraints);
-        stream = await navigator.mediaDevices.getUserMedia(constraints);
-        console.log('Successfully got media stream');
-        lastError = null;
-        break;
-      } catch (err) {
-        console.error('getUserMedia failed:', err);
-        lastError = err;
-        const isNotFound = err.name === 'NotFoundError' || /Requested device not found/i.test(err.message || '');
-        const isPermissionDenied = err.name === 'NotAllowedError' || /permission/i.test(err.message || '');
-        const isAbortInvalidState = (err.name === 'AbortError' && /Invalid state/i.test(err.message || '')) || /Invalid state/i.test(err.message || '');
+    let streamIdToUse = streamId;
+    let audioAllowed = !!options.includeAudio;
+    let retriedWithFreshStreamId = false;
 
-        if (isPermissionDenied) {
-          throw new Error('Permission denied. Please allow screen capture access.');
-        }
+    while (!stream) {
+      const ensured = await ensureStreamId(streamIdToUse, audioAllowed);
+      streamIdToUse = ensured.streamId;
+      audioAllowed = ensured.audioAllowed;
 
-        // Some Chrome versions transiently throw AbortError: Invalid state — wait and retry once
-        if (isAbortInvalidState) {
-          try {
-            await new Promise(r => setTimeout(r, 150));
-            console.warn('Retrying getUserMedia after AbortError Invalid state...');
-            stream = await navigator.mediaDevices.getUserMedia(constraints);
-            console.log('Successfully got media stream after retry');
-            lastError = null;
-            break;
-          } catch (retryErr) {
-            console.error('Retry after AbortError also failed:', retryErr);
-            lastError = retryErr;
+      const constraintsToTry = constraintsToTryBase.map(fn => fn(streamIdToUse, audioAllowed));
+
+      for (const constraints of constraintsToTry) {
+        try {
+          console.log('Trying getUserMedia with constraints:', constraints);
+          stream = await navigator.mediaDevices.getUserMedia(constraints);
+          console.log('Successfully got media stream');
+          lastError = null;
+          break;
+        } catch (err) {
+          console.error('getUserMedia failed:', err);
+          lastError = err;
+          const isNotFound = err.name === 'NotFoundError' || /Requested device not found/i.test(err.message || '');
+          const isPermissionDenied = err.name === 'NotAllowedError' || /permission/i.test(err.message || '');
+          const isAbortInvalidState = (err.name === 'AbortError' && /Invalid state/i.test(err.message || '')) || /Invalid state/i.test(err.message || '');
+
+          if (isPermissionDenied) {
+            throw new Error('Permission denied. Please allow screen capture access.');
           }
-        }
 
-        // If audio seems to be the culprit, try without audio
-        if (options.includeAudio && (isNotFound || isAbortInvalidState) && !tryWithoutAudio) {
-          console.warn('Audio device not found, retrying without audio');
-          tryWithoutAudio = true;
-          try {
-            const retryConstraints = JSON.parse(JSON.stringify(constraints));
-            // Remove audio entirely
-            delete retryConstraints.audio;
-            console.log('Retry constraints without audio:', retryConstraints);
-            stream = await navigator.mediaDevices.getUserMedia(retryConstraints);
-            console.log('Successfully got media stream without audio');
-            options.includeAudio = false;
-            chrome.runtime.sendMessage({ action: 'recordingWarning', message: 'Recording without audio' }).catch(() => {});
-            lastError = null;
-            break;
-          } catch (retryErr) {
-            console.error('Retry without audio also failed:', retryErr);
-            lastError = retryErr;
+          // Some Chrome versions transiently throw AbortError: Invalid state — wait and retry once
+          if (isAbortInvalidState) {
+            try {
+              await new Promise(r => setTimeout(r, 150));
+              console.warn('Retrying getUserMedia after AbortError Invalid state...');
+              stream = await navigator.mediaDevices.getUserMedia(constraints);
+              console.log('Successfully got media stream after retry');
+              lastError = null;
+              break;
+            } catch (retryErr) {
+              console.error('Retry after AbortError also failed:', retryErr);
+              lastError = retryErr;
+            }
           }
+
+          // If audio seems to be the culprit, try without audio
+          if (audioAllowed && (isNotFound || isAbortInvalidState) && !tryWithoutAudio) {
+            console.warn('Audio device not found, retrying without audio');
+            tryWithoutAudio = true;
+            try {
+              const retryConstraints = JSON.parse(JSON.stringify(constraints));
+              // Remove audio entirely
+              delete retryConstraints.audio;
+              console.log('Retry constraints without audio:', retryConstraints);
+              stream = await navigator.mediaDevices.getUserMedia(retryConstraints);
+              console.log('Successfully got media stream without audio');
+              options.includeAudio = false;
+              audioAllowed = false;
+              chrome.runtime.sendMessage({ action: 'recordingWarning', message: 'Recording without audio' }).catch(() => {});
+              lastError = null;
+              break;
+            } catch (retryErr) {
+              console.error('Retry without audio also failed:', retryErr);
+              lastError = retryErr;
+            }
+          }
+          // Continue to next variant
         }
-        // Continue to next variant
       }
-    }
-    
-    if (!stream) {
-      const tried = constraintsToTry.map(c => Object.keys(c).join('+')).join(' | ');
-      const errorMsg = lastError ? `${lastError.name}: ${lastError.message} (mode=${captureMode}, tried=${tried})` : 'Failed to acquire capture stream';
+
+      if (stream) {
+        break;
+      }
+
+      const triedKeys = constraintsToTry.map(c => Object.keys(c).join('+')).join(' | ');
+      const isStreamInvalid = lastError && (lastError.name === 'NotFoundError' || /Requested device not found/i.test(lastError.message || ''));
+
+      if (captureMode === 'browser' && isStreamInvalid && !retriedWithFreshStreamId) {
+        console.warn('Stream ID appears invalid, requesting a new selection and retrying capture.');
+        retriedWithFreshStreamId = true;
+        streamIdToUse = null;
+        tryWithoutAudio = false;
+        continue;
+      }
+
+      const errorMsg = lastError ? `${lastError.name}: ${lastError.message} (mode=${captureMode}, tried=${triedKeys})` : 'Failed to acquire capture stream';
       console.error('All getUserMedia attempts failed:', errorMsg);
       throw new Error(errorMsg);
     }
+
+    streamId = streamIdToUse;
 
     const videoTrack = stream.getVideoTracks()[0];
     const audioTracks = stream.getAudioTracks();
@@ -409,50 +584,27 @@ async function startRecording(streamId, captureMode, options) {
     }
     
     recordedChunks = [];
+    chunkBufferSize = 0;
     mediaRecorder = new MediaRecorder(stream, recorderOptions);
     
     mediaRecorder.ondataavailable = (event) => {
       if (event.data && event.data.size > 0) {
         recordedChunks.push(event.data);
+        if (chunkConfig.enabled) {
+          chunkBufferSize += event.data.size;
+          if (chunkBufferSize >= chunkConfig.sizeBytes) {
+            queueChunkFlush(false);
+          }
+        }
       }
     };
     
     mediaRecorder.onstop = async () => {
-      stopBufferMonitoring();
-      
-      const blob = new Blob(recordedChunks, { type: 'video/webm' });
-      const url = URL.createObjectURL(blob);
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
-      const filename = `recording_${timestamp}.webm`;
-      
       try {
-        await chrome.runtime.sendMessage({
-          action: 'saveRecording',
-          url: url,
-          filename: filename
-        });
-        
-        chrome.runtime.sendMessage({
-          action: 'recordingComplete',
-          success: true
-        });
+        await finalizeRecording();
       } catch (error) {
-        chrome.runtime.sendMessage({
-          action: 'recordingComplete',
-          success: false,
-          error: error.message
-        });
+        console.error('Finalize recording error:', error);
       }
-      
-      URL.revokeObjectURL(url);
-      recordedChunks = [];
-      
-      if (stream) {
-        stream.getTracks().forEach(track => track.stop());
-        stream = null;
-      }
-
-      stopLocalAudioPlayback();
     };
     
     mediaRecorder.onerror = (error) => {
@@ -500,61 +652,121 @@ async function startRecording(streamId, captureMode, options) {
       stream.getTracks().forEach(track => track.stop());
       stream = null;
     }
+    recordedChunks = [];
+    chunkBufferSize = 0;
+    chunkFlushPromise = Promise.resolve();
+    lastChunkError = null;
+    chunkConfig = createDefaultChunkConfig('');
+    recordingIdentifier = '';
+    mediaRecorder = null;
     throw error;
   }
 }
 
-async function stopRecording() {
-  return new Promise((resolve, reject) => {
-    if (!mediaRecorder || mediaRecorder.state === 'inactive') {
-      stopBufferMonitoring();
-      stopLocalAudioPlayback();
-      stopAudioVisualizer();
-      resolve();
-      return;
-    }
-    
-    stopBufferMonitoring();
-    
-    mediaRecorder.onstop = async (...args) => {
+async function finalizeRecording() {
+  stopBufferMonitoring();
+  stopLocalAudioPlayback();
+  stopAudioVisualizer();
+
+  try {
+    if (chunkConfig.enabled) {
+      if (recordedChunks.length > 0) {
+        await queueChunkFlush(true);
+      }
+      await chunkFlushPromise;
+      if (lastChunkError) {
+        throw lastChunkError;
+      }
+      chrome.runtime.sendMessage({
+        action: 'recordingComplete',
+        success: true,
+        chunked: true,
+        chunks: chunkConfig.savedChunks,
+        baseName: chunkConfig.baseName
+      }).catch(() => {});
+    } else {
       const blob = new Blob(recordedChunks, { type: 'video/webm' });
-      const url = URL.createObjectURL(blob);
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
-      const filename = `recording_${timestamp}.webm`;
-      
-      try {
-        await chrome.runtime.sendMessage({
-          action: 'saveRecording',
-          url: url,
-          filename: filename
-        });
-        
+      if (!blob.size) {
         chrome.runtime.sendMessage({
           action: 'recordingComplete',
-          success: true
-        });
+          success: true,
+          chunked: false,
+          empty: true
+        }).catch(() => {});
+      } else {
+        const url = URL.createObjectURL(blob);
+        const filenameBase = recordingIdentifier || new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+        const filename = `recording_${filenameBase}.webm`;
+        try {
+          const response = await chrome.runtime.sendMessage({
+            action: 'saveRecording',
+            url,
+            filename,
+            saveAs: true,
+            conflictAction: 'uniquify'
+          });
+          if (!response || !response.success) {
+            throw new Error(response?.error || 'Failed to save recording');
+          }
+          chrome.runtime.sendMessage({
+            action: 'recordingComplete',
+            success: true
+          }).catch(() => {});
+        } finally {
+          URL.revokeObjectURL(url);
+        }
+      }
+    }
+  } catch (error) {
+    chrome.runtime.sendMessage({
+      action: 'recordingComplete',
+      success: false,
+      error: error instanceof Error ? error.message : String(error)
+    }).catch(() => {});
+    throw error;
+  } finally {
+    recordedChunks = [];
+    chunkBufferSize = 0;
+    chunkFlushPromise = Promise.resolve();
+    lastChunkError = null;
+    chunkConfig = createDefaultChunkConfig('');
+    recordingIdentifier = '';
+    currentBufferSize = 0;
+    startTime = 0;
+    if (stream) {
+      stream.getTracks().forEach(track => track.stop());
+      stream = null;
+    }
+    mediaRecorder = null;
+    stopLocalAudioPlayback();
+    stopAudioVisualizer();
+  }
+}
+
+async function stopRecording() {
+  if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+    stopBufferMonitoring();
+    stopLocalAudioPlayback();
+    stopAudioVisualizer();
+    return;
+  }
+
+  stopBufferMonitoring();
+
+  return new Promise((resolve, reject) => {
+    mediaRecorder.onstop = async () => {
+      try {
+        await finalizeRecording();
         resolve();
       } catch (error) {
-        chrome.runtime.sendMessage({
-          action: 'recordingComplete',
-          success: false,
-          error: error.message
-        });
         reject(error);
       }
-      
-      URL.revokeObjectURL(url);
-      recordedChunks = [];
-      
-      if (stream) {
-        stream.getTracks().forEach(track => track.stop());
-        stream = null;
-      }
-
-      stopLocalAudioPlayback();
-      stopAudioVisualizer();
     };
-    
-    mediaRecorder.stop();
+
+    try {
+      mediaRecorder.stop();
+    } catch (error) {
+      reject(error);
+    }
   });
 }

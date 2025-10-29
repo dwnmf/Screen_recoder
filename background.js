@@ -4,6 +4,25 @@ chrome.runtime.onInstalled.addListener(() => {
   console.log('Tab Screen Recorder extension installed');
 });
 
+function normalizeDownloadFilename(filename) {
+  if (!filename || typeof filename !== 'string') {
+    return `recording_${Date.now()}.webm`;
+  }
+
+  const cleanedSegments = filename
+    .replace(/\\/g, '/')
+    .split('/')
+    .map(segment => segment.trim())
+    .filter(segment => segment && segment !== '..')
+    .map(segment => segment
+      .replace(/\s+/g, ' ')
+      .replace(/[^a-zA-Z0-9 _.\-]/g, '_')
+    );
+
+  const joined = cleanedSegments.join('/');
+  return joined || `recording_${Date.now()}.webm`;
+}
+
 async function setupOffscreenDocument() {
   if (offscreenDocumentCreated) return;
 
@@ -54,15 +73,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   
   if (message.action === 'saveRecording') {
-    chrome.downloads.download({
+    const downloadOptions = {
       url: message.url,
-      filename: message.filename,
-      saveAs: true
-    }, (downloadId) => {
+      filename: normalizeDownloadFilename(message.filename),
+      saveAs: typeof message.saveAs === 'boolean' ? message.saveAs : true,
+      conflictAction: message.conflictAction || 'uniquify'
+    };
+
+    chrome.downloads.download(downloadOptions, (downloadId) => {
       if (chrome.runtime.lastError) {
         sendResponse({ success: false, error: chrome.runtime.lastError.message });
       } else {
-        sendResponse({ success: true });
+        sendResponse({ success: true, downloadId });
       }
     });
     return true;
@@ -169,7 +191,8 @@ async function handleStartCapture(options, sender) {
       captureMode: captureMode,
       options: {
         fps: options.fps,
-        includeAudio: allowAudio
+        includeAudio: allowAudio,
+        chunk: options.chunk
       }
     });
 
@@ -193,7 +216,8 @@ async function handleStartWithProvidedStreamId(payload) {
       captureMode: captureMode,
       options: {
         fps: payload.fps,
-        includeAudio: !!payload.includeAudio
+        includeAudio: !!payload.includeAudio,
+        chunk: payload.chunk
       }
     });
     return response;

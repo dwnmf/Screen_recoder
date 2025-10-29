@@ -15,6 +15,10 @@ const captureModeRadios = document.querySelectorAll('input[name="captureMode"]')
 const audioNoteDiv = document.getElementById('audioNote');
 const vizCanvas = document.getElementById('audioViz');
 const vizCtx = vizCanvas.getContext('2d');
+const chunkCheckbox = document.getElementById('chunkEnabled');
+const chunkOptions = document.getElementById('chunkOptions');
+const chunkSizeInput = document.getElementById('chunkSize');
+const chunkFolderInput = document.getElementById('chunkFolder');
 
 startBtn.addEventListener('click', startRecording);
 stopBtn.addEventListener('click', stopRecording);
@@ -27,6 +31,21 @@ captureModeRadios.forEach(radio => {
       tabSelectGroup.style.display = 'none';
     }
   });
+});
+
+chunkCheckbox.addEventListener('change', () => {
+  toggleChunkOptions(chunkCheckbox.checked);
+  persistChunkSettings();
+});
+
+chunkSizeInput.addEventListener('change', () => {
+  normalizeChunkSizeInput();
+  persistChunkSettings();
+});
+
+chunkFolderInput.addEventListener('blur', () => {
+  chunkFolderInput.value = sanitizeFolderValue(chunkFolderInput.value);
+  persistChunkSettings();
 });
 
 async function loadTabs() {
@@ -69,12 +88,15 @@ async function checkRecordingStatus() {
       setRecordingUI();
       updateTimer();
       timerInterval = setInterval(updateTimer, 1000);
+    } else {
+      setChunkControlsDisabled(false);
     }
   } catch (error) {
     console.error('Failed to check status:', error);
   }
 }
 
+initializeSettings();
 loadTabs();
 checkRecordingStatus();
 
@@ -88,6 +110,19 @@ async function startRecording() {
     const fps = parseInt(fpsSelect.value);
     const includeAudio = audioCheckbox.checked;
     const captureMode = document.querySelector('input[name="captureMode"]:checked').value;
+    const chunkEnabled = chunkCheckbox.checked;
+    const chunkSizeMB = normalizeChunkSizeInput();
+    const chunkFolder = sanitizeFolderValue(chunkFolderInput.value);
+    const chunkOptionsPayload = {
+      enabled: chunkEnabled,
+      sizeMB: chunkSizeMB,
+      folder: chunkFolder
+    };
+
+    if (chunkFolderInput.value !== chunkFolder) {
+      chunkFolderInput.value = chunkFolder;
+    }
+
     let tabId = null;
     if (captureMode === 'tab') {
       const raw = tabSelect.value;
@@ -117,7 +152,8 @@ async function startRecording() {
         tabId: null,
         targetTabId: targetTabId,
         fps: fps,
-        includeAudio: includeAudio
+        includeAudio: includeAudio,
+        chunk: chunkOptionsPayload
       });
     } else {
       response = await chrome.runtime.sendMessage({
@@ -126,7 +162,8 @@ async function startRecording() {
         tabId: tabId,
         targetTabId: targetTabId,
         fps: fps,
-        includeAudio: includeAudio
+        includeAudio: includeAudio,
+        chunk: chunkOptionsPayload
       });
     }
     
@@ -141,7 +178,10 @@ async function startRecording() {
       isRecording: true,
       startTime: startTime,
       fps: fps,
-      includeAudio: includeAudio
+      includeAudio: includeAudio,
+      chunkEnabled: chunkEnabled,
+      chunkSizeMB: chunkSizeMB,
+      chunkFolder: chunkFolder
     });
     
     setRecordingUI();
@@ -163,6 +203,7 @@ function setRecordingUI() {
   fpsSelect.disabled = true;
   audioCheckbox.disabled = true;
   captureModeRadios.forEach(radio => radio.disabled = true);
+  setChunkControlsDisabled(true);
   
   statusDiv.textContent = '● Recording...';
   statusDiv.className = 'status recording';
@@ -212,6 +253,7 @@ function resetUI() {
   fpsSelect.disabled = false;
   audioCheckbox.disabled = false;
   captureModeRadios.forEach(radio => radio.disabled = false);
+  setChunkControlsDisabled(false);
   timerDiv.textContent = '00:00';
   timerDiv.classList.remove('active');
   bufferSizeDiv.textContent = '';
@@ -243,7 +285,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     resetUI();
     
     if (message.success) {
-      statusDiv.textContent = 'Recording saved!';
+      if (message.chunked) {
+        const chunkCount = Number(message.chunks) || 0;
+        const chunkLabel = chunkCount === 1 ? 'chunk' : 'chunks';
+        statusDiv.textContent = chunkCount > 0 ? `Saved ${chunkCount} ${chunkLabel}` : 'Recording saved!';
+      } else {
+        statusDiv.textContent = 'Recording saved!';
+      }
       statusDiv.className = 'status success';
       setTimeout(() => {
         statusDiv.textContent = '';
@@ -315,4 +363,74 @@ function drawBars(bars) {
     vizCtx.fillStyle = `rgb(${shade}, ${shade}, ${shade})`;
     vizCtx.fillRect(x, y, barWidth, barHeight);
   }
+}
+
+async function initializeSettings() {
+  try {
+    const stored = await chrome.storage.local.get({
+      chunkEnabled: false,
+      chunkSizeMB: 100,
+      chunkFolder: ''
+    });
+
+    chunkCheckbox.checked = !!stored.chunkEnabled;
+    chunkSizeInput.value = normalizeChunkSizeInput(stored.chunkSizeMB);
+    chunkFolderInput.value = sanitizeFolderValue(stored.chunkFolder);
+    toggleChunkOptions(chunkCheckbox.checked);
+  } catch (error) {
+    console.error('Failed to load settings:', error);
+    chunkCheckbox.checked = false;
+    chunkSizeInput.value = 100;
+    chunkFolderInput.value = '';
+    toggleChunkOptions(false);
+  }
+}
+
+function toggleChunkOptions(enabled) {
+  chunkOptions.hidden = !enabled;
+  setChunkControlsDisabled(chunkCheckbox.disabled);
+}
+
+function setChunkControlsDisabled(disabled) {
+  chunkCheckbox.disabled = disabled;
+  chunkSizeInput.disabled = disabled || !chunkCheckbox.checked;
+  chunkFolderInput.disabled = disabled || !chunkCheckbox.checked;
+}
+
+function normalizeChunkSizeInput(value) {
+  const raw = value !== undefined ? value : parseInt(chunkSizeInput.value, 10);
+  const fallback = 100;
+  let parsed = Number(raw);
+  if (!Number.isFinite(parsed)) {
+    parsed = fallback;
+  }
+  parsed = Math.min(Math.max(Math.round(parsed), 10), 2048);
+  if (value === undefined) {
+    chunkSizeInput.value = parsed;
+  }
+  return parsed;
+}
+
+function sanitizeFolderValue(raw) {
+  if (!raw) {
+    return '';
+  }
+  let value = String(raw).trim();
+  value = value.replace(/\\/g, '/');
+  value = value.replace(/\.+/g, '.');
+  value = value.replace(/^\/+/, '').replace(/\/+$/, '');
+  value = value.replace(/\.\//g, '').replace(/\/\./g, '/');
+  value = value.split('/').map(segment => {
+    const cleaned = segment.trim().replace(/[^a-zA-Z0-9 _.-]/g, '');
+    return cleaned;
+  }).filter(Boolean).join('/');
+  return value;
+}
+
+function persistChunkSettings() {
+  chrome.storage.local.set({
+    chunkEnabled: chunkCheckbox.checked,
+    chunkSizeMB: normalizeChunkSizeInput(),
+    chunkFolder: sanitizeFolderValue(chunkFolderInput.value)
+  });
 }
